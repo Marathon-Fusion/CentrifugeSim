@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "centrifugesim"
+version = "0.1.0"
+description = "Plasma centrifuge simulation code"
+authors = [{ name = "Marco Acciarri" }]
+dependencies = [
+    "cupy-cuda11x",  # or 12x if you upgrade
+    "numpy",
+    "scipy",
+    "numba",
+    "matplotlib",
+]
