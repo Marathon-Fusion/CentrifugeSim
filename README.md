@@ -1,2 +1,2 @@
 # CentrifugeSim
-Plasma centrifuge code.
+Plasma centrifuge Hybrid-PIC code
