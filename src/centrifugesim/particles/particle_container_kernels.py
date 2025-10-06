@@ -1,8 +1,5 @@
 import cupy as cp
 
-# TO DO:
-#   REWRITE THIS USING C++ and PYBIND11
-
 BorisPushKernel = cp.RawKernel(r'''
 extern "C" __global__
 void BorisPushKernel(const int N, const float dt, const float q_m,
@@ -178,59 +175,6 @@ void gatherScalarField(const int N,
 ''', "gatherScalarField")
 
 
-gatherScalarField_qdsmc = cp.RawKernel(r'''
-extern "C" __global__
-void gatherScalarField_qdsmc(const int N,
-                       const int Nr, const int Nz,
-                       const float dr, const float dz, const float zmin,
-                       const float* __restrict__ r_particles,
-                       const float* __restrict__ z_particles,
-                       const float* __restrict__ field,
-                       float* __restrict__ Fp)
-{
-    int p = blockDim.x * blockIdx.x + threadIdx.x;
-    if (p < N) {
-        // Compute the floating-point grid indices for this particle.
-        float i_float = r_particles[p] / dr - 0.5;
-        float j_float = (z_particles[p] - zmin) / dz - 0.5;
-        
-        // Lower grid indices.
-        int i0 = (int)floorf(i_float);
-        int j0 = (int)floorf(j_float);
-
-        // Clamp indices to ensure that (i0+1) and (j0+1) are valid.
-        if (i0 < 0) i0 = 0;
-        if (i0 > Nr - 2) i0 = Nr - 2;
-        if (j0 < 0) j0 = 0;
-        if (j0 > Nz - 2) j0 = Nz - 2;
-                                       
-        // Fractional parts (weights).
-        float alpha = i_float - i0;
-        float beta  = j_float - j0;
-                                       
-        // Bilinear weights.
-        float w00 = (1.0f - alpha) * (1.0f - beta);
-        float w10 =  alpha         * (1.0f - beta);
-        float w01 = (1.0f - alpha) * beta;
-        float w11 =  alpha         * beta;
-
-        // Compute 1D indices for the four surrounding grid nodes.
-        int idx00 = i0 * Nz + j0;
-        int idx10 = (i0 + 1) * Nz + j0;
-        int idx01 = i0 * Nz + (j0 + 1);
-        int idx11 = (i0 + 1) * Nz + (j0 + 1);
-
-        // Bilinearly interpolate the scalar field.
-        float interp_value = w00 * field[idx00] + w10 * field[idx10] +
-                             w01 * field[idx01] + w11 * field[idx11];
-
-        // Store the interpolated value in the output array.
-        Fp[p] = interp_value;
-    }
-}
-''', "gatherScalarField_qdsmc")
-
-
 depositScalarKernel = cp.RawKernel(r'''
 extern "C" __global__
 void depositScalarKernel(const int N,
@@ -280,60 +224,3 @@ void depositScalarKernel(const int N,
     }
 }
 ''', "depositScalarKernel")
-
-
-depositScalarKernel_qdsmc = cp.RawKernel(r'''
-extern "C" __global__
-void depositScalarKernel_qdsmc(const int N,
-                           const float* __restrict__ r_particles,
-                           const float* __restrict__ z_particles,
-                           const float* __restrict__ scalar_p,
-                           const float* __restrict__ w_p,
-                           double* __restrict__ field,
-                           const int Nr, const int Nz,
-                           const float dr, const float dz, const float zmin)
-{
-    int p = blockDim.x * blockIdx.x + threadIdx.x;
-    if (p < N) {
-        // Compute the floating-point grid indices for this particle.
-        float i_float = r_particles[p] / dr - 0.5;
-        float j_float = (z_particles[p] - zmin) / dz - 0.5;
-        
-        // Lower grid indices.
-        int i0 = (int)floorf(i_float);
-        int j0 = (int)floorf(j_float);
-        
-        // Clamp indices to ensure that (i0+1) and (j0+1) are valid.
-        if (i0 < 0) i0 = 0;
-        if (i0 > Nr - 2) i0 = Nr - 2;
-        if (j0 < 0) j0 = 0;
-        if (j0 > Nz - 2) j0 = Nz - 2;
-                                         
-        // Fractional parts (weights).
-        float alpha = i_float - i0;
-        float beta  = j_float - j0;
-
-        // Bilinear weights.
-        float w00 = (1.0f - alpha) * (1.0f - beta);
-        float w10 =  alpha         * (1.0f - beta);
-        float w01 = (1.0f - alpha) * beta;
-        float w11 =  alpha         * beta;               
-        
-        // Compute the particle's contribution (property * weight).
-        double deposit = (double)scalar_p[p] * (double)w_p[p];
-        
-        // Compute 1D indices for the four surrounding grid nodes.
-        int idx00 = i0 * Nz + j0;
-        int idx10 = (i0 + 1) * Nz + j0;
-        int idx01 = i0 * Nz + (j0 + 1);
-        int idx11 = (i0 + 1) * Nz + (j0 + 1);
-        
-        // Deposit contributions atomically.
-        atomicAdd(&field[idx00], deposit * w00);
-        atomicAdd(&field[idx10], deposit * w10);
-        atomicAdd(&field[idx01], deposit * w01);
-        atomicAdd(&field[idx11], deposit * w11);
-                                   
-    }
-}
-''', "depositScalarKernel_qdsmc")
