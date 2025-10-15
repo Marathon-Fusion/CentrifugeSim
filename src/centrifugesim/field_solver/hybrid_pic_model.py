@@ -5,7 +5,7 @@ from centrifugesim import constants
 
 
 class HybridPICModel:
-    def __init__(self, geometry):
+    def __init__(self, geometry, ne_floor, Te_floor):
         # geometry info
         self.zmin = geometry.zmin
         self.Nr = geometry.Nr
@@ -13,6 +13,10 @@ class HybridPICModel:
         self.dr = geometry.dr
         self.dz = geometry.dz
         self.r  = geometry.r   # 1D array of length Nr (cell centers)
+
+        # floor values
+        self.ne_floor = ne_floor
+        self.Te_floor = Te_floor
 
         # fields
         self.phi = np.zeros((self.Nr, self.Nz))
@@ -28,6 +32,10 @@ class HybridPICModel:
         self.Br = np.zeros((self.Nr, self.Nz))
         self.Bt = np.zeros((self.Nr, self.Nz))  # unused in solver; kept for pusher
         self.Bz = np.zeros((self.Nr, self.Nz))
+
+        self.br = np.zeros((self.Nr, self.Nz)) # Br/Bmag
+        self.bz = np.zeros((self.Nr, self.Nz)) # Bz/Bmag
+        self.Bmag = np.zeros((self.Nr, self.Nz))
 
         # Electrical conductivities (tensor components)
         self.sigma_H = np.zeros((self.Nr, self.Nz))
