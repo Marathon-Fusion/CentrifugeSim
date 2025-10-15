@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools"]
+requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,10 +7,19 @@ name = "centrifugesim"
 version = "0.1.0"
 description = "Plasma centrifuge simulation code"
 authors = [{ name = "Marco Acciarri" }]
+requires-python = ">=3.10"
 dependencies = [
-    "cupy-cuda11x",  # or 12x if you upgrade
-    "numpy",
-    "scipy",
-    "numba",
-    "matplotlib",
+  "cupy-cuda11x",   # use 12x if your CUDA toolkit/driver matches
+  "numpy",
+  "scipy",
+  "numba",
+  "matplotlib",
 ]
+
+# Tell setuptools you're using a src/ layout
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["centrifugesim*"]

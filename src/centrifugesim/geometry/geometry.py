@@ -19,6 +19,8 @@ class Geometry:
         rmin_anode: float,
         zmin_anode: float,
         zmax_anode: float,
+        temperature_cathode: float,
+        temperature_anode: float
     ):
         # Domain limits
         self.rmin = 0.0
@@ -64,6 +66,10 @@ class Geometry:
         self.mask = np.ones((self.Nr, self.Nz), dtype=np.int8)
         self.mask[self.cathode_mask] = 0
         self.mask[self.anode_mask] = 0
+
+        # Cathode and anode temperatures
+        self.temperature_cathode = temperature_cathode
+        self.temperature_anode = temperature_anode
 
         # Coils store (outside-domain only)
         self.coils: Dict[str, Dict[str, float]] = {}
