@@ -7,7 +7,7 @@ from centrifugesim.initialization.init_particles import init_particles_positions
 
 class ParticleContainer:
 
-    def __init__(self, Z, m, name, rmax_p, zmin_p, zmax_p, rmax_BC, zmin_BC, zmax_BC, N, Nr, Nz, rmax_vec=np.array([])):
+    def __init__(self, Z, m, name, rmax_p, zmin_p, zmax_p, rmax_BC, zmin_BC, zmax_BC, N, Nr, Nz):
         
         self.N = N
         self.Z = Z
@@ -17,8 +17,6 @@ class ParticleContainer:
         self.name = name
         
         self.rmax_p, self.zmin_p, self.zmax_p = rmax_p, zmin_p, zmax_p
-
-        self.rmax_vec = rmax_vec # size Nz
 
         self.rmax_BC = rmax_BC
         self.zmin_BC = zmin_BC
