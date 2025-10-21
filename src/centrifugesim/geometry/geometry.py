@@ -249,6 +249,7 @@ class Geometry:
         from mpi4py import MPI
         from dolfinx.io import gmshio
         from dolfinx import fem as _fem
+        import ufl
         import numpy as _np
 
         comm = MPI.COMM_WORLD
@@ -427,8 +428,8 @@ class Geometry:
         msh.topology.create_connectivity(tdim - 1, 0)
 
         # Build measures
-        dx = _fem.measure.dx(domain=msh)
-        ds = _fem.measure.ds(domain=msh, subdomain_data=facet_tags)
+        dx = ufl.dx(domain=msh)
+        ds = ufl.Measure("ds", domain=msh, subdomain_data=facet_tags)
 
         # Stash everything on self.fem
         tags = {
