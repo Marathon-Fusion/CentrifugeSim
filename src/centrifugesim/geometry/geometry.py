@@ -55,9 +55,16 @@ class Geometry:
         self.rmax_anode = self.rmax
         self.zmin_anode = float(zmin_anode)
         self.zmax_anode = float(zmax_anode)
-        self.anode_mask = (
+        self.zmin_anode2 = float(zmin_anode2)
+        
+        self.anode1_mask = (
             (self.r[:, None] >= self.rmin_anode) & (self.r[:, None] <= self.rmax_anode) &
             (self.z[None, :] >= self.zmin_anode) & (self.z[None, :] <= self.zmax_anode)
+        )
+
+        self.anode2_mask = (
+            (self.r[:, None] >= self.rmin_anode) & (self.r[:, None] <= self.rmax_anode) &
+            (self.z[None, :] >= self.zmin_anode2) & (self.z[None, :] <= self.zmin_anode2+(self.zmax_anode-self.zmin_anode))
         )
 
         # Cathode (bool mask)
@@ -73,7 +80,8 @@ class Geometry:
         # Solve mask: int8 (1 = solve, 0 = masked)
         self.mask = np.ones((self.Nr, self.Nz), dtype=np.int8)
         self.mask[self.cathode_mask] = 0
-        self.mask[self.anode_mask] = 0
+        self.mask[self.anode1_mask] = 0
+        self.mask[self.anode2_mask] = 0
 
         # Cathode and anode temperatures
         self.temperature_cathode = temperature_cathode
