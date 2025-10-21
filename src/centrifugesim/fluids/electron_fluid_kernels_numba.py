@@ -1,8 +1,96 @@
 import numpy as np
 import numba
+from numba import njit
 
 from centrifugesim import constants
 
+# Small floors to avoid division-by-zero in edge cells
+NU_FLOOR = 1e-30
+B_FLOOR  = 1e-5
+
+#################################################################################
+################################### Helper kernels ##############################
+#################################################################################
+@njit(cache=True)
+def _kBT(Te, Te_is_eV):
+    """Return k_B T in Joules (same shape as Te)."""
+    if Te_is_eV:
+        # k_B*T = Te[eV]*q_e
+        return Te * constants.q_e
+    else:
+        return Te * constants.kb
+
+
+@njit(cache=True)
+def electron_collision_frequencies(
+    Te, ne, nn,
+    lnLambda=10.0,
+    sigma_en_m2=5e-20,     # momentum-transfer X-section (tune for your gas)
+    Te_is_eV=False
+):
+    """
+    Compute electron collision frequencies (1/s):
+      - nu_en: electron-neutral momentum-transfer
+      - nu_ei: electron-ion (Spitzer)
+      - nu_e : total = nu_en + nu_ei
+    Inputs are arrays Te [K or eV], ne [m^-3], nn [m^-3] with identical shapes.
+    """
+    kBT = _kBT(Te, Te_is_eV)                                   # J
+    vth_e = np.sqrt(8.0 * kBT / (np.pi * constants.m_e))       # m/s
+
+    # Electron-neutral (hard-sphere-like, momentum-transfer)
+    nu_en = nn * sigma_en_m2 * vth_e                           # 1/s
+
+    # Electron-ion (Spitzer), Z=1, ni=ne
+    c_num = 4.0 * np.sqrt(2.0 * np.pi) * (constants.q_e**4) * lnLambda
+    c_den = 3.0 * (4.0 * np.pi * constants.ep0)**2 * np.sqrt(constants.m_e)
+    nu_ei = c_num * ne / (c_den * (kBT**1.5 + 0.0))            # 1/s
+
+    # Total + floors
+    nu_e  = nu_en + nu_ei
+    nu_en = np.maximum(nu_en, NU_FLOOR)
+    nu_ei = np.maximum(nu_ei, NU_FLOOR)
+    nu_e  = np.maximum(nu_e,  NU_FLOOR)
+    return nu_en, nu_ei, nu_e
+
+
+@njit(cache=True)
+def electron_conductivities(
+    Te, ne, nn, Br, Bz,
+    lnLambda=10.0,
+    sigma_en_m2=5e-20,
+    Te_is_eV=False
+):
+    """
+    Electron conductivity tensor components (SI, S/m):
+      - sigma_par_e : parallel to B
+      - sigma_P_e   : Pedersen (perpendicular, in-plane with E_perp)
+      - sigma_H_e   : Hall (perpendicular, out-of-phase; negative for electrons)
+    Inputs:
+      Te [K or eV], ne [m^-3], nn [m^-3], Br [T], Bz [T] (same shape)
+    Assumes: Z=1, ni = ne (quasineutral).
+    """
+    # Collisions
+    _, _, nu_e = electron_collision_frequencies(Te, ne, nn, lnLambda, sigma_en_m2, Te_is_eV)
+
+    # |B|
+    Bmag = np.sqrt(Br*Br + Bz*Bz) + B_FLOOR
+
+    # Electron gyrofrequency magnitude
+    Omega_e = constants.q_e * Bmag / constants.m_e  # rad/s
+
+    # Prefactor ne e^2 / m_e
+    pref = ne * (constants.q_e * constants.q_e) / constants.m_e  # S·s/m
+
+    # Components (electrons only)
+    sigma_par_e = pref / nu_e
+    denom = (nu_e*nu_e + Omega_e*Omega_e)
+    sigma_P_e = pref * (nu_e / denom)
+    sigma_H_e = - pref * (Omega_e / denom)
+
+    return sigma_par_e, sigma_P_e, sigma_H_e, Omega_e/nu_e  # β_e
+
+# Move this solve to 
 @numba.jit(nopython=True, parallel=True, nogil=True)
 def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
                br, bz, kappa_parallel, kappa_perp,
