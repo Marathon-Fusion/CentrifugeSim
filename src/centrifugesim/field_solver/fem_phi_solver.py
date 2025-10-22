@@ -426,10 +426,12 @@ def solve_phi_axisym(geom,
                      Jz0: float = -2.0e1,
                      sigma_r: float = 5.0e-3,
                      phi_a: float = 0.0,
+                     phi_guess: fem.Function | None = None,
                      proj_opts: dict | None = None):
     """
     Solve using FEM coefficient Functions already stored in `coeffs`.
-    No NumPy grids here. This is the 'FEM-driven' variant.
+    Optional `phi_guess` (Function on the same V) is used as a PETSc initial guess.
+    Returns KSP iteration count as 'ksp_iterations' in the output dict.
     """
     msh        = geom.fem.mesh
     facet_tags = geom.fem.facet_tags
@@ -441,18 +443,12 @@ def solve_phi_axisym(geom,
     x = ufl.SpatialCoordinate(msh)
     r = x[0]
 
-    # Unpack
-    pe = coeffs["pe"]
-    ne = coeffs["ne"]
-    inv_e_ne = coeffs["inv_e_ne"]
-    sigma_parallel = coeffs["sigma_parallel"]
-    sigma_P        = coeffs["sigma_P"]
-    sigma_H        = coeffs["sigma_H"]
-    un_r     = coeffs["un_r"]
-    un_theta = coeffs["un_theta"]
-    Bz       = coeffs["Bz"]
+    # Unpack coeffs
+    pe = coeffs["pe"]; ne = coeffs["ne"]; inv_e_ne = coeffs["inv_e_ne"]
+    sigma_parallel = coeffs["sigma_parallel"]; sigma_P = coeffs["sigma_P"]; sigma_H = coeffs["sigma_H"]
+    un_r = coeffs["un_r"]; un_theta = coeffs["un_theta"]; Bz = coeffs["Bz"]
 
-    # Sources and tensor
+    # Sources/tensor
     grad_pe = ufl.grad(pe)
     S_r = - inv_e_ne*grad_pe[0] + Bz*un_theta
     S_z = - inv_e_ne*grad_pe[1]
@@ -464,11 +460,11 @@ def solve_phi_axisym(geom,
     a = ufl.inner(K*ufl.grad(u), ufl.grad(v)) * r * dx
     L = ufl.inner(J_S, ufl.grad(v))            * r * dx
 
-    # Neumann on cathode top (J_tot·n = Jz_profile)
+    # Neumann on cathode top
     Jz_profile = Jz0 * ufl.exp(-0.5*(r/sigma_r)**2)
     L += (Jz_profile * v) * r * ds(tags["CATH_TOP"])
 
-    # Dirichlet: anode island + right wall mid + right wall top
+    # Dirichlet on anode edges + right wall (mid, top)
     bcs = []
     phi_a_fun = fem.Function(V); phi_a_fun.x.array[:] = phi_a
     for key in ("ANODE_ISL", "RIGHT_MID", "RIGHT_TOP"):
@@ -478,17 +474,40 @@ def solve_phi_axisym(geom,
             if dofs.size > 0:
                 bcs.append(fem.dirichletbc(phi_a_fun, dofs))
 
-    problem = LinearProblem(a, L, bcs=bcs,
-                            petsc_options={"ksp_type": "cg", "pc_type": "hypre", "ksp_rtol": 1e-9})
+    # Prepare solution holder and PETSc options
+    phi_u = fem.Function(V, name="phi")
+    petsc_opts = {"ksp_type": "cg", "pc_type": "hypre", "ksp_rtol": 1e-5}
+    if phi_guess is not None:
+        # Copy user's guess to the solution vector and enable nonzero initial guess
+        if phi_guess.function_space is V:
+            phi_u.x.array[:] = phi_guess.x.array
+            phi_u.x.scatter_forward()
+        else:
+            # fallback: copy as array if sizes match (same mesh/space assumed by user)
+            phi_u.x.array[:] = phi_guess.x.array
+            phi_u.x.scatter_forward()
+        petsc_opts["ksp_initial_guess_nonzero"] = True
+    
+    # Solve with LinearProblem (and pass 'u=phi_u' so KSP uses our vector)
+    problem = LinearProblem(a, L, bcs=bcs, u=phi_u, petsc_options=petsc_opts)
     phi = problem.solve()
+
+    # Try to fetch KSP iterations
+    ksp_its = -1
+    for attr in ("solver", "ksp", "_solver"):
+        if hasattr(problem, attr):
+            try:
+                ksp_its = getattr(problem, attr).getIterationNumber()
+                break
+            except Exception:
+                pass
 
     # Projections
     def _project(expr, name: str):
         up, vp = ufl.TrialFunction(V), ufl.TestFunction(V)
         aP = ufl.inner(up, vp) * dx
         LP = ufl.inner(expr, vp) * dx
-        opts = {"ksp_type": "cg", "pc_type": "jacobi"}
-        if proj_opts is not None: opts = proj_opts
+        opts = {"ksp_type": "cg", "pc_type": "jacobi"} if proj_opts is None else proj_opts
         proj = LinearProblem(aP, LP, petsc_options=opts)
         out = fem.Function(V, name=name)
         out.x.array[:] = proj.solve().x.array
@@ -500,7 +519,7 @@ def solve_phi_axisym(geom,
     Jr = _project(-(sigma_P * grad_phi[0]) + (sigma_P * S_r + sigma_H * Bz * un_r), "Jr")
     Jz = _project(-(sigma_parallel * grad_phi[1]) + (sigma_parallel * S_z),          "Jz")
 
-    # Ohmic heating in neutral frame E' = E + u_n×B - ∇pe/(e ne)
+    # Ohmic heating in neutral frame
     Eprime_r = -grad_phi[0] + S_r
     Eprime_z = -grad_phi[1] + S_z
     q_ohm = _project(sigma_P*Eprime_r*Eprime_r + sigma_parallel*Eprime_z*Eprime_z, "q_ohm")
@@ -520,7 +539,8 @@ def solve_phi_axisym(geom,
         "Jr": Jr, "Jz": Jz,
         "q_ohm": q_ohm,
         "coeffs": coeffs,
-        "integrals": {"I_applied": I_applied, "I_from_solution": I_from_sol}
+        "integrals": {"I_applied": I_applied, "I_from_solution": I_from_sol},
+        "ksp_iterations": ksp_its,
     }
 
 
@@ -530,11 +550,11 @@ def solve_phi_axisym_from_grids(
     pe_grid: np.ndarray | None = None,
     ne_grid: np.ndarray | None = None,
     Te_grid: np.ndarray | None = None,
-    # optional transport fields; if None, simple defaults from ne are used
+    # optional transport fields
     sigma_parallel_grid: np.ndarray | None = None,
     sigma_P_grid: np.ndarray | None = None,
     sigma_H_grid: np.ndarray | None = None,
-    # flow and B (defaults to zero flow and uniform Bz=0):
+    # flow and B
     un_r_grid: np.ndarray | None = None,
     un_theta_grid: np.ndarray | None = None,
     Bz_grid: np.ndarray | None = None,
@@ -542,14 +562,13 @@ def solve_phi_axisym_from_grids(
     Jz0: float = -2.0e1,
     sigma_r: float = 5.0e-3,
     phi_a: float = 0.0,
+    # optional initial guess (Function on the same mesh/space)
+    phi_guess: fem.Function | None = None,
     # projection solver options
     proj_opts: dict | None = None,
 ):
     """
-    Solve for φ on geom.fem.mesh, using axisymmetric weighted form and
-    your boundary conditions. All *_grid arrays are defined on geom.r × geom.z.
-
-    Returns a dict with DOLFINx Functions and integral diagnostics.
+    Same as before, but accepts optional `phi_guess` and returns 'ksp_iterations'.
     """
     assert hasattr(geom, "fem"), "Geometry has no FEM mesh. Call geom.build_fem_mesh() first."
 
@@ -564,14 +583,13 @@ def solve_phi_axisym_from_grids(
     r = x[0]
 
     # -- Build coefficient Functions and assign from grids --
-    def F(name):
-        return fem.Function(V, name=name)
+    def F(name): return fem.Function(V, name=name)
 
     # Pressure/electron properties
     if pe_grid is None:
         if (ne_grid is None) or (Te_grid is None):
             raise ValueError("Provide either pe_grid, or both ne_grid and Te_grid.")
-        pe_grid = constants.kb * ne_grid * Te_grid  # KB * ne * Te
+        pe_grid = constants.kb * ne_grid * Te_grid
 
     pe = F("pe"); _assign_from_rect_grid(pe, pe_grid, geom.r, geom.z)
     ne = F("ne"); _assign_from_rect_grid(ne, ne_grid, geom.r, geom.z)
@@ -580,37 +598,31 @@ def solve_phi_axisym_from_grids(
     sigma_P        = F("sigma_P");        _assign_from_rect_grid(sigma_P,        sigma_P_grid,        geom.r, geom.z)
     sigma_H        = F("sigma_H");        _assign_from_rect_grid(sigma_H,        sigma_H_grid,        geom.r, geom.z)
 
-    # Flow and B
     un_r     = F("un_r");     _assign_from_rect_grid(un_r,     np.zeros_like(pe_grid) if un_r_grid     is None else un_r_grid,     geom.r, geom.z)
     un_theta = F("un_theta"); _assign_from_rect_grid(un_theta, np.zeros_like(pe_grid) if un_theta_grid is None else un_theta_grid, geom.r, geom.z)
     Bz       = F("Bz");       _assign_from_rect_grid(Bz,       np.zeros_like(pe_grid) if Bz_grid       is None else Bz_grid,       geom.r, geom.z)
 
-    # 1/(e ne): if ne not supplied, infer from pe with a dummy Te to avoid singularities
-    QE = constants.q_e
-    tiny = 1e-300
+    QE = constants.q_e; tiny = 1e-300
     inv_e_ne = F("inv_e_ne"); _assign_from_rect_grid(inv_e_ne, 1.0/(QE*(ne_grid + tiny)), geom.r, geom.z)
 
-    # Source terms (neutral frame E'):  S_r = - (∂pe/∂r)/(e ne) + Bz*un_theta ; S_z = - (∂pe/∂z)/(e ne)
+    # Sources/tensor
     grad_pe = ufl.grad(pe)
     S_r = - inv_e_ne*grad_pe[0] + Bz*un_theta
     S_z = - inv_e_ne*grad_pe[1]
     J_S = ufl.as_vector([sigma_P*S_r + sigma_H*Bz*un_r, sigma_parallel*S_z])
-    K   = ufl.as_matrix([[sigma_P, 0.0],
-                         [0.0,     sigma_parallel]])
+    K   = ufl.as_matrix([[sigma_P, 0.0], [0.0, sigma_parallel]])
 
-    # ---------- Weak form (axisymmetric) ----------
-    u = ufl.TrialFunction(V); v = ufl.TestFunction(V)
+    # Weak forms
+    u, v = ufl.TrialFunction(V), ufl.TestFunction(V)
     a = ufl.inner(K*ufl.grad(u), ufl.grad(v)) * r * dx
     L = ufl.inner(J_S, ufl.grad(v))            * r * dx
 
-    # Neumann: J_tot·n = Jz_profile on the cathode top
+    # BCs
     Jz_profile = Jz0 * ufl.exp(-0.5*(r/sigma_r)**2)
     L += ( Jz_profile * v ) * r * ds(tags["CATH_TOP"])
 
-    # Dirichlet on: anode island edges, right wall between anodes, and right wall above anodes
     bcs = []
     phi_a_fun = fem.Function(V); phi_a_fun.x.array[:] = phi_a
-
     for key in ("ANODE_ISL", "RIGHT_MID", "RIGHT_TOP"):
         facets = facet_tags.find(tags[key])
         if facets.size > 0:
@@ -618,18 +630,35 @@ def solve_phi_axisym_from_grids(
             if dofs.size > 0:
                 bcs.append(fem.dirichletbc(phi_a_fun, dofs))
 
+    # Initial guess + PETSc options
+    phi_u = fem.Function(V, name="phi")
+    petsc_opts = {"ksp_type": "cg", "pc_type": "hypre", "ksp_rtol": 1e-9}
+    if phi_guess is not None:
+        phi_u.x.array[:] = phi_guess.x.array
+        phi_u.x.scatter_forward()
+        petsc_opts["ksp_initial_guess_nonzero"] = True
+
     # Solve
-    problem = LinearProblem(a, L, bcs=bcs,
-                            petsc_options={"ksp_type": "cg", "pc_type": "hypre", "ksp_rtol": 1e-9})
+    problem = LinearProblem(a, L, bcs=bcs, u=phi_u, petsc_options=petsc_opts)
     phi = problem.solve()
 
-    # ---------- Derived fields ----------
+    # Try to fetch KSP iterations
+    ksp_its = -1
+    for attr in ("solver", "ksp", "_solver"):
+        if hasattr(problem, attr):
+            try:
+                ksp_its = getattr(problem, attr).getIterationNumber()
+                break
+            except Exception:
+                pass
+
+    # Projections
     def _project(expr, name: str):
         up, vp = ufl.TrialFunction(V), ufl.TestFunction(V)
         aP = ufl.inner(up, vp) * dx
         LP = ufl.inner(expr, vp) * dx
-        opts = {"ksp_type": "cg", "pc_type": "jacobi"}
-        proj = LinearProblem(aP, LP, petsc_options=opts if proj_opts is None else proj_opts)
+        opts = {"ksp_type": "cg", "pc_type": "jacobi"} if proj_opts is None else proj_opts
+        proj = LinearProblem(aP, LP, petsc_options=opts)
         out = fem.Function(V, name=name)
         out.x.array[:] = proj.solve().x.array
         return out
@@ -637,20 +666,18 @@ def solve_phi_axisym_from_grids(
     grad_phi = ufl.grad(phi)
     Er = _project(-grad_phi[0], "Er")
     Ez = _project(-grad_phi[1], "Ez")
-
     Jr = _project(-(sigma_P * grad_phi[0]) + (sigma_P * S_r + sigma_H * Bz * un_r), "Jr")
     Jz = _project(-(sigma_parallel * grad_phi[1]) + (sigma_parallel * S_z),          "Jz")
 
-    # E' for heating: E' = E + u_n×B - ∇pe/(e ne)  => components already in S_r, S_z
+    # q_ohm
     Eprime_r = -grad_phi[0] + S_r
     Eprime_z = -grad_phi[1] + S_z
     q_ohm = _project(sigma_P*Eprime_r*Eprime_r + sigma_parallel*Eprime_z*Eprime_z, "q_ohm")
 
-    # ---------- Diagnostics on cathode top ----------
+    # Diagnostics
     two_pi = 2.0*np.pi
     n = ufl.FacetNormal(msh)
     Jtot = K*ufl.grad(phi) - J_S
-
     I_applied = fem.assemble_scalar(fem.form(two_pi * r * Jz_profile         * ds(tags["CATH_TOP"])))
     I_from_sol= fem.assemble_scalar(fem.form(two_pi * r * ufl.inner(Jtot, n) * ds(tags["CATH_TOP"])))
 
@@ -664,11 +691,10 @@ def solve_phi_axisym_from_grids(
             "pe": pe, "sigma_parallel": sigma_parallel, "sigma_P": sigma_P, "sigma_H": sigma_H,
             "Bz": Bz, "un_r": un_r, "un_theta": un_theta, "inv_e_ne": inv_e_ne, "ne": ne
         },
-        "integrals": {
-            "I_applied": I_applied,
-            "I_from_solution": I_from_sol
-        }
+        "integrals": {"I_applied": I_applied, "I_from_solution": I_from_sol},
+        "ksp_iterations": ksp_its,
     }
+
 
 def functions_to_rect_grids(geom,
                             fields: dict[str, fem.Function],
