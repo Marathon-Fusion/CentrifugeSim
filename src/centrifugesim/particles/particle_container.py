@@ -71,28 +71,36 @@ class ParticleContainer:
                        Bp_r, Bp_t, Bp_z))
          
       
-    def PushX_old(self, dt):
+    def PushX(self, dt):
+        
+        # Calculate the components of the new position vector
+        # (as if in a local Cartesian frame x' = r + vr*dt, y' = vt*dt)
+        r_component = self.r + self.vr*dt
+        t_component = self.vt*dt
 
-        self.r += self.vr*dt
+        # Update z position (this is trivial)
         self.z += self.vz*dt
+        
+        # Calculate the new radial magnitude
+        r_new = cp.sqrt(r_component**2 + t_component**2)
+        
+        # Epsilon for numerical stability to avoid division by zero at r=0
+        epsilon = 1e-35
+        
+        # Calculate sin and cos of the rotation angle
+        cos_alpha = r_component / (r_new + epsilon)
+        sin_alpha = t_component / (r_new + epsilon)
 
-        self.ApplyBCparticles(self.rmax_p, self.zmin_p, self.zmax_p, dt)
-
-    
-    def PushX(self,dt):
-            
-        self.r += self.vr*dt
-        self.z += self.vz*dt
-
-        drt = self.vt*dt
-        r_prime = cp.sqrt(self.r**2 + drt**2)
-        cos_alpha = self.r/r_prime
-        sin_alpha = drt/r_prime
-
-        vr_ = cp.copy(self.vr)
-        vt_ = cp.copy(self.vt)
-        self.vr = cos_alpha*vr_ + sin_alpha*vt_
-        self.vt = -sin_alpha*vr_ + cos_alpha*vt_
+        # Copy old velocities for rotation
+        vr_old = cp.copy(self.vr)
+        vt_old = cp.copy(self.vt)
+        
+        # Apply rotation to get velocity components in the new basis
+        self.vr[:] = cos_alpha*vr_old + sin_alpha*vt_old
+        self.vt[:] = -sin_alpha*vr_old + cos_alpha*vt_old
+        
+        # Assign the correct new radial position to self.r
+        self.r[:] = r_new
         
         self.ApplyBCparticles(self.rmax_p, self.zmin_p, self.zmax_p, dt)
 
