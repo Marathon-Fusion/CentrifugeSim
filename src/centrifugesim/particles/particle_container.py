@@ -78,8 +78,14 @@ class ParticleContainer:
         r_component = self.r + self.vr*dt
         t_component = self.vt*dt
 
-        # Update z position (this is trivial)
+        # Update r and z position
+        self.r += self.vr*dt
         self.z += self.vz*dt
+
+        ind_r0 = cp.flatnonzero(self.r<0)
+        if(ind_r0.shape[0]>0):
+            self.r[ind_r0] = cp.abs(self.r[ind_r0])
+            self.vr[ind_r0] = cp.abs(self.vr[ind_r0])
         
         # Calculate the new radial magnitude
         r_new = cp.sqrt(r_component**2 + t_component**2)
@@ -98,10 +104,7 @@ class ParticleContainer:
         # Apply rotation to get velocity components in the new basis
         self.vr[:] = cos_alpha*vr_old + sin_alpha*vt_old
         self.vt[:] = -sin_alpha*vr_old + cos_alpha*vt_old
-        
-        # Assign the correct new radial position to self.r
-        self.r[:] = r_new
-        
+                
         self.ApplyBCparticles(self.rmax_p, self.zmin_p, self.zmax_p, dt)
 
 

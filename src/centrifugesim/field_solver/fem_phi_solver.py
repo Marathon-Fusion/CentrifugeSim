@@ -705,7 +705,7 @@ def functions_to_rect_grids(geom,
                             parallel: bool | None = None,
                             root: int | None = None) -> dict[str, np.ndarray | None]:
     """
-    Sample DOLFINx scalar Functions on the (Nr×Nz) rect grid.
+    Sample DOLFINx scalar Functions on the (NrxNz) rect grid.
     - If 'sampler' is a ParallelRectSampler (or parallel=True), evaluate in MPI and assemble via Allreduce.
     - If 'sampler' is a RectSampler (or parallel=False), evaluate on this rank only.
     - If 'root' is not None in parallel mode, only that rank returns the arrays; others return None.
