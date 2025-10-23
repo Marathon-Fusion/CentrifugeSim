@@ -24,23 +24,25 @@ class ElectronFluidContainer:
         self.ne_floor = ne_floor
         self.Te_floor = Te_floor
 
-        self.ne = np.zeros((geom.Nr,geom.Nz)).astype(np.float64) # [m^-3]
-        self.Te = np.zeros((geom.Nr,geom.Nz)).astype(np.float64) # [K] !
-        self.pe = np.zeros((geom.Nr,geom.Nz)).astype(np.float64) # [Pa] !
+        self.ne_grid = np.zeros((geom.Nr,geom.Nz)).astype(np.float64) # [m^-3]
+        self.Te_grid = np.zeros((geom.Nr,geom.Nz)).astype(np.float64) # [K] !
+        self.pe_grid = np.zeros((geom.Nr,geom.Nz)).astype(np.float64) # [Pa] !
 
-        self.nu_ei = np.zeros((geom.Nr,geom.Nz)).astype(np.float64)
-        self.nu_en = np.zeros((geom.Nr,geom.Nz)).astype(np.float64)
-        self.nu_e = np.zeros((geom.Nr,geom.Nz)).astype(np.float64)
+        self.nu_ei_grid = np.zeros((geom.Nr,geom.Nz)).astype(np.float64)
+        self.nu_en_grid = np.zeros((geom.Nr,geom.Nz)).astype(np.float64)
+        self.nu_e_grid = np.zeros((geom.Nr,geom.Nz)).astype(np.float64)
 
-        self.sigma_P = np.zeros((geom.Nr,geom.Nz)).astype(np.float64)
-        self.sigma_parallel = np.zeros((geom.Nr,geom.Nz)).astype(np.float64)
-        self.sigma_H = np.zeros((geom.Nr,geom.Nz)).astype(np.float64)
+        self.sigma_P_grid = np.zeros((geom.Nr,geom.Nz)).astype(np.float64)
+        self.sigma_parallel_grid = np.zeros((geom.Nr,geom.Nz)).astype(np.float64)
+        self.sigma_H_grid = np.zeros((geom.Nr,geom.Nz)).astype(np.float64)
 
-        self.kappa_parallel = np.zeros((geom.Nr,geom.Nz)).astype(np.float64)
-        self.kappa_perp = np.zeros((geom.Nr,geom.Nz)).astype(np.float64)
+        self.kappa_parallel_grid = np.zeros((geom.Nr,geom.Nz)).astype(np.float64)
+        self.kappa_perp_grid = np.zeros((geom.Nr,geom.Nz)).astype(np.float64)
+
+        self.beta_e_grid = np.zeros((geom.Nr,geom.Nz)).astype(np.float64) 
 
     def update_pressure(self):
-        self.pe = constants.kb*self.Te*self.ne
+        self.pe_grid = constants.kb*self.Te_grid*self.ne_grid
 
     def set_kappa(self, hybrid_pic):
         """
@@ -52,9 +54,9 @@ class ElectronFluidContainer:
         where tau_e = 1 / (nu_ei + nu_en), Omega_e = e * |B| / m_e.
         """
         # Short-hands
-        ne = self.ne
-        Te = self.Te
-        Bmag = hybrid_pic.Bmag
+        ne = self.ne_grid
+        Te = self.Te_grid
+        Bmag = hybrid_pic.Bmag_grid
 
         # Physical constants
         kb = constants.kb
@@ -64,7 +66,7 @@ class ElectronFluidContainer:
         # Numerically safe floors
         ne_eff = np.maximum(ne, self.ne_floor)        # m^-3 (very small floor just to avoid div-by-zero)
         Te_eff = np.maximum(Te, self.Te_floor)       # K
-        nu_e   = np.maximum(self.nu_e, 1e-30)  # total electron momentum-transfer frequency
+        nu_e   = np.maximum(self.nu_e_grid, 1e-30)  # total electron momentum-transfer frequency
         tau_e  = 1.0 / nu_e
 
         # Electron gyrofrequency
@@ -79,11 +81,11 @@ class ElectronFluidContainer:
         kappa_perp = kappa_par / (1.0 + chi2)
 
         # Write back
-        self.kappa_parallel[:, :] = kappa_par
-        self.kappa_perp[:, :]     = kappa_perp
+        self.kappa_parallel_grid[:, :] = kappa_par
+        self.kappa_perp_grid[:, :]     = kappa_perp
 
     def set_electron_collision_frequencies(
-        self, Te, ne, nn, lnLambda=10.0, sigma_en_m2=5e-20, Te_is_eV=False
+        self, nn_grid, lnLambda=10.0, sigma_en_m2=5e-20, Te_is_eV=False
     ):
         """
         Compute and set electron collision frequencies:
@@ -91,43 +93,42 @@ class ElectronFluidContainer:
           - self.nu_ei : electron-ion (Spitzer)
           - self.nu_e  : total = nu_en + nu_ei
         """
-        nu_en, nu_ei, nu_e = electron_fluid_kernels_numba.electron_collision_frequencies(
-            Te, ne, nn, lnLambda=lnLambda, sigma_en_m2=sigma_en_m2, Te_is_eV=Te_is_eV
+        nu_en_grid, nu_ei_grid, nu_e_grid = electron_fluid_kernels_numba.electron_collision_frequencies(
+            self.Te_grid, self.ne_grid, nn_grid, lnLambda=lnLambda, sigma_en_m2=sigma_en_m2, Te_is_eV=Te_is_eV
         )
-        self.nu_en[:] = nu_en
-        self.nu_ei[:] = nu_ei
-        self.nu_e[:]  = nu_e
-        return self.nu_en, self.nu_ei, self.nu_e
+        self.nu_en_grid[:] = nu_en_grid
+        self.nu_ei_grid[:] = nu_ei_grid
+        self.nu_e_grid[:]  = nu_e_grid
 
     def set_electron_conductivities(
-        self, Te, ne, nn, Br=None, Bz=None, lnLambda=10.0, sigma_en_m2=5e-20, Te_is_eV=False
+        self, hybrid_pic, nn_grid, lnLambda=10.0, sigma_en_m2=5e-20, Te_is_eV=False
     ):
         """
         Compute and set electron conductivity tensor components:
           - self.sigma_parallel, self.sigma_P, self.sigma_H
         """
-        Br = self.Br if Br is None else Br
-        Bz = self.Bz if Bz is None else Bz
+
+        Bmag_grid = hybrid_pic.Bmag_grid
 
         sigma_par_e, sigma_P_e, sigma_H_e, _beta_e = electron_fluid_kernels_numba.electron_conductivities(
-            Te, ne, nn, Br, Bz, lnLambda=lnLambda, sigma_en_m2=sigma_en_m2, Te_is_eV=Te_is_eV
+            self.Te_grid, self.ne_grid, nn_grid, Bmag_grid, lnLambda=lnLambda, sigma_en_m2=sigma_en_m2, Te_is_eV=Te_is_eV
         )
-        self.sigma_parallel[:] = sigma_par_e
-        self.sigma_P[:]        = sigma_P_e
-        self.sigma_H[:]        = sigma_H_e
-        return self.sigma_P, self.sigma_parallel, self.sigma_H
+        self.sigma_parallel_grid[:] = sigma_par_e
+        self.sigma_P_grid[:]        = sigma_P_e
+        self.sigma_H_grid[:]        = sigma_H_e
+        self.beta_e_grid[:]         = _beta_e
 
-    def update_Te(self, geometry, hybrid_pic, Q_Joule, T_i, T_n, m_i, m_n, dt):
+    def update_Te(self, geometry, hybrid_pic, Q_Joule_grid, T_i_grid, T_n_grid, m_i, m_n, dt):
         "Update Te function solving energy equation"
-        Te_new = np.zeros_like(self.Te)
+        Te_new = np.zeros_like(self.Te_grid)
 
         # Effective thermal diffusivity for electrons from parallel conductivity
         # D_eff = (2/3) * kappa_parallel / (n_e * k_B)
         with np.errstate(divide='ignore', invalid='ignore'):
-            D_eff = (2.0 * self.kappa_parallel) / (3.0 * self.ne * constants.kb)
+            D_eff = (2.0 * self.kappa_parallel_grid) / (3.0 * self.ne_grid * constants.kb)
 
         # Zero diffusion where n_e is below floor
-        D_eff = np.where(self.ne < self.ne_floor, 0.0, D_eff)
+        D_eff = np.where(self.ne_grid < self.ne_floor, 0.0, D_eff)
 
         # Stable explicit timestep for 2D diffusion-like operator:
         # dt_stable = 1 / ( 2 * D_max * (1/dr^2 + 1/dz^2) )
@@ -139,14 +140,16 @@ class ElectronFluidContainer:
         else:
             dt_stable = dt  # no diffusion -> no stability restriction
 
+        Q_Joule_grid = np.where(self.ne_grid<=self.n0_floor, 0, Q_Joule_grid)
+
         # Helper to perform one advance with a given local dt
         def _advance(dt_local):
             electron_fluid_kernels_numba.solve_step(
-                self.Te, Te_new,
+                self.Te_grid, Te_new,
                 geometry.dr, geometry.dz, geometry.r,
                 self.ne, Q_Joule,
-                hybrid_pic.br, hybrid_pic.bz,
-                self.kappa_parallel, self.kappa_perp,
+                hybrid_pic.br_grid, hybrid_pic.bz_grid,
+                self.kappa_parallel_grid, self.kappa_perp_grid,
                 geometry.mask, dt_local
             )
             self.Te[:, :] = Te_new
@@ -172,20 +175,20 @@ class ElectronFluidContainer:
 
         # --- Collision energy exchange term uses the full dt (outside of sub-steps) ---
         self.compute_elastic_collisions_term(
-            T_i, T_n, self.nu_ei, self.nu_en, m_i, m_n, dt
+            T_i_grid, T_n_grid, self.nu_ei_grid, self.nu_en_grid, m_i, m_n, dt
         )
 
-    def compute_elastic_collisions_term(self, T_i, T_n, nu_ei, nu_en, m_i, m_n, dt):
+    def compute_elastic_collisions_term(self, T_i_grid, T_n_grid, m_i, m_n, dt):
         """
         Collisional Energy Exchange
         """
         m_ratio_i = constants.m_e/m_i
         m_ratio_n = constants.m_e/m_n
-        Q_coll = 3 * self.ne * constants.kb * (
-            m_ratio_i * nu_ei * (self.Te - T_i) +
-            m_ratio_n * nu_en * (self.Te - T_n)
+        Q_coll = 3 * self.ne_grid * constants.kb * (
+            m_ratio_i * self.nu_ei_grid * (self.Te_grid - T_i_grid) +
+            m_ratio_n * self.nu_en_grid * (self.Te_grid - T_n_grid)
         )
-        self.Te -= dt*Q_coll/(3/2*constants.kb*self.ne)
+        self.Te_grid -= dt*Q_coll/(3/2*constants.kb*self.ne_grid)
 
     def apply_boundary_conditions(self):
         """
@@ -194,11 +197,11 @@ class ElectronFluidContainer:
         Use geometry object and update with 
         """
         # Axis of symmetry (r=0): dTe/dr = 0
-        self.Te[0, :] = self.Te[1, :]
+        self.Te_grid[0, :] = self.Te_grid[1, :]
 
         # Outer walls: zero-flux
-        self.Te[-1, :] = self.Te[-2, :]
-        self.Te[:, 0] = self.Te[:, 1]
-        self.Te[:, -1] = self.Te[:, -2]
+        self.Te_grid[-1, :] = self.Te_grid[-2, :]
+        self.Te_grid[:, 0] = self.Te_grid[:, 1]
+        self.Te_grid[:, -1] = self.Te_grid[:, -2]
 
         # Fix above, set heat flux to electrodes and dielectric, no flux only on z+ and axis.
