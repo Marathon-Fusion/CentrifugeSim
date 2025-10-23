@@ -25,7 +25,7 @@ def _kBT(Te, Te_is_eV):
 def electron_collision_frequencies(
     Te, ne, nn,
     lnLambda=10.0,
-    sigma_en_m2=5e-20,     # momentum-transfer X-section (tune for your gas)
+    sigma_en_m2=5e-20, # momentum transfer cross section, should have integral of cross section and distribution function and save it (interpolate) to then use here.
     Te_is_eV=False
 ):
     """
@@ -56,9 +56,9 @@ def electron_collision_frequencies(
 
 @njit(cache=True)
 def electron_conductivities(
-    Te, ne, nn, Br, Bz,
+    Te, ne, nn, Bmag,
     lnLambda=10.0,
-    sigma_en_m2=5e-20,
+    sigma_en_m2=5e-20, # momentum transfer cross section, should have integral of cross section and distribution function and save it (interpolate) to then use here.
     Te_is_eV=False
 ):
     """
@@ -74,7 +74,7 @@ def electron_conductivities(
     _, _, nu_e = electron_collision_frequencies(Te, ne, nn, lnLambda, sigma_en_m2, Te_is_eV)
 
     # |B|
-    Bmag = np.sqrt(Br*Br + Bz*Bz) + B_FLOOR
+    Bmag += B_FLOOR
 
     # Electron gyrofrequency magnitude
     Omega_e = constants.q_e * Bmag / constants.m_e  # rad/s
@@ -99,6 +99,8 @@ def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
     Advances the electron temperature Te by one time step DT.
     Uses an explicit, cell-centered finite difference scheme.
     The energy equation is only solved where mask == 1.
+    Should improve this to reduce number of steps needed, explicit Euler for now
+    just for testing, do not use for production runs.
     """
     NR, NZ = Te.shape
 
