@@ -1,7 +1,6 @@
 import numpy as np
 
-#from centrifugesim.fluids import electron_fluid_kernels_numba
-
+from centrifugesim.geometry.geometry import Geometry
 from centrifugesim.field_solver.fem_phi_solver import (
     init_phi_coeffs, update_phi_coeffs_from_grids, solve_phi_axisym,
     functions_to_rect_grids, _get_rect_sampler
@@ -10,7 +9,7 @@ from centrifugesim import constants
 
 
 class HybridPICModel:
-    def __init__(self, geom):
+    def __init__(self, geom:Geometry):
         # geometry info
         self.zmin = geom.zmin
         self.Nr = geom.Nr
@@ -59,18 +58,34 @@ class HybridPICModel:
 
         self.sol = {}
 
-    def update_phi_coeffs(self, geom, electron_fluid, un_r_grid, un_theta_grid):
+    def compute_B_aux(self):
+        self.Bmag_grid[:] = np.sqrt(self.Br_grid**2 + self.Bz_grid**2)
+        self.br_grid[:] = np.where(self.Bmag_grid==0, 0, self.Br_grid/self.Bmag_grid)
+        self.bz_grid[:] = np.where(self.Bmag_grid==0, 0, self.Bz_grid/self.Bmag_grid)
+
+    def update_phi_coeffs(self, geom:Geometry, electron_fluid, neutral_fluid):
+
+        # Forcing pe to be 0 for this solver so it does not blow up
+        # Need to calculate grad_pe before and set to 0 at mask face boundaries
+        ne_aux_grid = np.copy(electron_fluid.ne_grid)
+        Te_aux_grid = 0*electron_fluid.Te_grid
+
         update_phi_coeffs_from_grids(
             geom, self.coeffs,
-            ne_grid=electron_fluid.ne_grid, Te_grid=electron_fluid.Te_grid,
-            sigma_parallel_grid=electron_fluid.sigma_par_grid,
+            ne_grid=ne_aux_grid,
+            Te_grid=Te_aux_grid,
+            sigma_parallel_grid=electron_fluid.sigma_parallel_grid,
             sigma_P_grid=electron_fluid.sigma_P_grid,
             sigma_H_grid=electron_fluid.sigma_H_grid,
-            Bz_grid=self.Bz_grid, un_r_grid=un_r_grid, un_theta_grid=un_theta_grid,
+            Bz_grid=self.Bz_grid,
+            un_r_grid=neutral_fluid.un_r_grid,
+            un_theta_grid=neutral_fluid.un_theta_grid,
         )
 
-    def solve_phi_and_sample_to_rect_grid(self, geom, Jz0, sigma_r, initial_solve=True):
-        
+    def solve_phi_and_update_fields_grid(self, geom:Geometry, Jz0, sigma_r, initial_solve=True):
+        """
+        Need to run update_phi_coeffs first
+        """
         if(initial_solve):
             sol = solve_phi_axisym(geom, self.coeffs, Jz0=Jz0, sigma_r=sigma_r, phi_a=0.0)
         else:
@@ -81,11 +96,14 @@ class HybridPICModel:
         rect = functions_to_rect_grids(geom, fields, sampler=self.sampler)
 
         self.phi_grid = rect["phi"]
-        self.Jer_grid = rect["Jr_grid"]; self.Jez_grid = rect["Jz_grid"]
-        self.Er_grid = rect["Er_grid"]; self.Ez_grid = rect["Ez_grid"]
+        self.Jer_grid = rect["Jr"]; self.Jez_grid = rect["Jz"]
+        self.Er_grid = rect["Er"]; self.Ez_grid = rect["Ez"]
         self.q_ohm_grid = rect["q_ohm"]
 
-        self.ne_grid[np.isnan(self.ne_grid)] = 0
+        # setting masked cathode and anode values to 0
+        self.phi_grid[np.isnan(self.phi_grid)] = 0
+        self.Jer_grid[np.isnan(self.Jer_grid)] = 0
+        self.Jez_grid[np.isnan(self.Jez_grid)] = 0
         self.Er_grid[np.isnan(self.Er_grid)] = 0
         self.Ez_grid[np.isnan(self.Ez_grid)] = 0
         self.q_ohm_grid[np.isnan(self.q_ohm_grid)] = 0
