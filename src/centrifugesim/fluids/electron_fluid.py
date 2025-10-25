@@ -1,5 +1,6 @@
 import numpy as np
 
+from centrifugesim.fluids.neutral_fluid import NeutralFluidContainer
 from centrifugesim.fluids import electron_fluid_kernels_numba
 from centrifugesim.geometry.geometry import Geometry
 from centrifugesim import constants
@@ -26,6 +27,9 @@ class ElectronFluidContainer:
 
         self.ne_grid = np.zeros((geom.Nr,geom.Nz)).astype(np.float64) # [m^-3]
         self.Te_grid = np.zeros((geom.Nr,geom.Nz)).astype(np.float64) # [K] !
+        self.Te_grid_prev = np.zeros((geom.Nr,geom.Nz)).astype(np.float64) # [K] !
+
+
         self.pe_grid = np.zeros((geom.Nr,geom.Nz)).astype(np.float64) # [Pa] !
 
         self.nu_ei_grid = np.zeros((geom.Nr,geom.Nz)).astype(np.float64)
@@ -101,7 +105,7 @@ class ElectronFluidContainer:
         self.nu_e_grid[:]  = nu_e_grid
 
     def set_electron_conductivities(
-        self, hybrid_pic, nn_grid, lnLambda=10.0, sigma_en_m2=5e-20, Te_is_eV=False
+        self, hybrid_pic, lnLambda=10.0, sigma_en_m2=5e-20, Te_is_eV=False
     ):
         """
         Compute and set electron conductivity tensor components:
@@ -111,14 +115,14 @@ class ElectronFluidContainer:
         Bmag_grid = hybrid_pic.Bmag_grid
 
         sigma_par_e, sigma_P_e, sigma_H_e, _beta_e = electron_fluid_kernels_numba.electron_conductivities(
-            self.Te_grid, self.ne_grid, nn_grid, Bmag_grid, lnLambda=lnLambda, sigma_en_m2=sigma_en_m2, Te_is_eV=Te_is_eV
+            self.Te_grid, self.ne_grid, Bmag_grid, self.nu_e_grid, lnLambda=lnLambda, sigma_en_m2=sigma_en_m2, Te_is_eV=Te_is_eV
         )
         self.sigma_parallel_grid[:] = sigma_par_e
         self.sigma_P_grid[:]        = sigma_P_e
         self.sigma_H_grid[:]        = sigma_H_e
         self.beta_e_grid[:]         = _beta_e
 
-    def update_Te(self, geometry, hybrid_pic, Q_Joule_grid, T_i_grid, T_n_grid, m_i, m_n, dt):
+    def update_Te(self, geom, hybrid_pic, neutral_fluid, Q_Joule_grid, dt):
         "Update Te function solving energy equation"
         Te_new = np.zeros_like(self.Te_grid)
 
@@ -132,7 +136,7 @@ class ElectronFluidContainer:
 
         # Stable explicit timestep for 2D diffusion-like operator:
         # dt_stable = 1 / ( 2 * D_max * (1/dr^2 + 1/dz^2) )
-        inv_h2 = (1.0 / geometry.dr**2) + (1.0 / geometry.dz**2)
+        inv_h2 = (1.0 / geom.dr**2) + (1.0 / geom.dz**2)
         Dmax = float(np.nanmax(D_eff)) if np.isfinite(D_eff).any() else 0.0
 
         if Dmax > 0.0 and np.isfinite(Dmax) and inv_h2 > 0.0:
@@ -140,19 +144,29 @@ class ElectronFluidContainer:
         else:
             dt_stable = dt  # no diffusion -> no stability restriction
 
-        Q_Joule_grid = np.where(self.ne_grid<=self.n0_floor, 0, Q_Joule_grid)
+        Q_Joule_grid = np.where(self.ne_grid<self.ne_floor, 0, Q_Joule_grid)
 
         # Helper to perform one advance with a given local dt
         def _advance(dt_local):
             electron_fluid_kernels_numba.solve_step(
                 self.Te_grid, Te_new,
-                geometry.dr, geometry.dz, geometry.r,
-                self.ne, Q_Joule,
+                geom.dr, geom.dz, geom.r,
+                self.ne_grid, Q_Joule_grid,
                 hybrid_pic.br_grid, hybrid_pic.bz_grid,
                 self.kappa_parallel_grid, self.kappa_perp_grid,
-                geometry.mask, dt_local
+                geom.mask, dt_local
             )
-            self.Te[:, :] = Te_new
+            self.Te_grid[:, :] = Te_new
+
+            # Enforce Dirichlet BCs at cathode and anode
+            # This is just to test, should change to sheath based model!
+            self.Te_grid[geom.cathode_mask] = geom.temperature_cathode
+            self.Te_grid[geom.anode1_mask] = geom.temperature_anode
+            self.Te_grid[geom.anode2_mask] = geom.temperature_anode
+
+            # BCs at rmin, rmax, zmin, zmax
+            # Using Neumann here, should change to sheath based model!
+            self.apply_boundary_conditions()
 
         # Sub-stepping controller
         if not np.isfinite(dt_stable) or dt_stable <= 0.0:
@@ -173,22 +187,53 @@ class ElectronFluidContainer:
             # Single step with dt
             _advance(dt)
 
-        # --- Collision energy exchange term uses the full dt (outside of sub-steps) ---
-        self.compute_elastic_collisions_term(
-            T_i_grid, T_n_grid, self.nu_ei_grid, self.nu_en_grid, m_i, m_n, dt
-        )
+        # self.Te_grid_prev = Te_grid.copy() # saving for ion T relaxation
 
-    def compute_elastic_collisions_term(self, T_i_grid, T_n_grid, m_i, m_n, dt):
+        # --- Collision energy exchange term uses the full dt (outside of sub-steps) ---
+        self.compute_elastic_collisions_term(geom, neutral_fluid, dt)
+
+        self.Te_grid[geom.cathode_mask] = geom.temperature_cathode
+        self.Te_grid[geom.anode1_mask] = geom.temperature_anode
+        self.Te_grid[geom.anode2_mask] = geom.temperature_anode
+
+        self.apply_boundary_conditions()
+
+    def compute_elastic_collisions_term(
+        self,
+        geom,
+        neutral_fluid,
+        dt,
+        cap=0.1
+    ):
         """
         Collisional Energy Exchange
+        - Keeping only neutral gas here.
+        - for collisions with ions should update ion Ti too but using particle ions
+          so might have to move to the drag diffusion part to keep it consistent..
+          It might have to use a much smaller timestep
         """
-        m_ratio_i = constants.m_e/m_i
-        m_ratio_n = constants.m_e/m_n
-        Q_coll = 3 * self.ne_grid * constants.kb * (
-            m_ratio_i * self.nu_ei_grid * (self.Te_grid - T_i_grid) +
-            m_ratio_n * self.nu_en_grid * (self.Te_grid - T_n_grid)
-        )
-        self.Te_grid -= dt*Q_coll/(3/2*constants.kb*self.ne_grid)
+        ne = np.where(self.ne_grid<self.ne_floor,self.ne_floor,self.ne_grid)
+        nn = np.where(neutral_fluid.nn_grid<neutral_fluid.nn_floor, neutral_fluid.nn_floor, neutral_fluid.nn_grid)
+
+        m_ratio_n = constants.m_e/neutral_fluid.mass
+        
+        # Substep count so that both nu_ei*dt_sub and nu_en*dt_sub <= cap (as requested)
+        max_nu_dt = 0.0
+        max_nu_dt = max(max_nu_dt, float(np.nanmax(self.nu_en_grid * m_ratio_n * dt)))
+        n_sub = int(np.ceil(max(1.0, max_nu_dt / cap)))
+        dt_sub = dt / n_sub
+
+        # Subcycling with operator splitting: e–i then e–n each substep
+        for _ in range(n_sub):
+            Q_coll_en = 3 * self.ne_grid * constants.kb * (
+                m_ratio_n * self.nu_en_grid * (self.Te_grid - neutral_fluid.T_n_grid) )
+
+            de = dt_sub*Q_coll_en[geom.mask==1] # J/m^3
+
+            # Write back masked regions
+            self.Te_grid[geom.mask==1] -= de/(3/2*constants.kb*ne[geom.mask==1])
+            neutral_fluid.T_n_grid[geom.mask==1] += de/(3/2*constants.kb*nn[geom.mask==1])
+
 
     def apply_boundary_conditions(self):
         """
@@ -203,5 +248,3 @@ class ElectronFluidContainer:
         self.Te_grid[-1, :] = self.Te_grid[-2, :]
         self.Te_grid[:, 0] = self.Te_grid[:, 1]
         self.Te_grid[:, -1] = self.Te_grid[:, -2]
-
-        # Fix above, set heat flux to electrodes and dielectric, no flux only on z+ and axis.

@@ -25,7 +25,7 @@ def _kBT(Te, Te_is_eV):
 def electron_collision_frequencies(
     Te, ne, nn,
     lnLambda=10.0,
-    sigma_en_m2=5e-20, # momentum transfer cross section, should have integral of cross section and distribution function and save it (interpolate) to then use here.
+    sigma_en_m2=3e-19, # momentum transfer cross section, should have integral of cross section and distribution function and save it (interpolate) to then use here.
     Te_is_eV=False
 ):
     """
@@ -44,7 +44,7 @@ def electron_collision_frequencies(
     # Electron-ion (Spitzer), Z=1, ni=ne
     c_num = 4.0 * np.sqrt(2.0 * np.pi) * (constants.q_e**4) * lnLambda
     c_den = 3.0 * (4.0 * np.pi * constants.ep0)**2 * np.sqrt(constants.m_e)
-    nu_ei = c_num * ne / (c_den * (kBT**1.5 + 0.0))            # 1/s
+    nu_ei = c_num * ne / (c_den * (kBT**1.5))            # 1/s
 
     # Total + floors
     nu_e  = nu_en + nu_ei
@@ -56,9 +56,9 @@ def electron_collision_frequencies(
 
 @njit(cache=True)
 def electron_conductivities(
-    Te, ne, nn, Bmag,
+    Te, ne, Bmag, nu_e,
     lnLambda=10.0,
-    sigma_en_m2=5e-20, # momentum transfer cross section, should have integral of cross section and distribution function and save it (interpolate) to then use here.
+    sigma_en_m2=3e-19, # momentum transfer cross section, should have integral of cross section and distribution function and save it (interpolate) to then use here.
     Te_is_eV=False
 ):
     """
@@ -70,9 +70,6 @@ def electron_conductivities(
       Te [K or eV], ne [m^-3], nn [m^-3], Br [T], Bz [T] (same shape)
     Assumes: Z=1, ni = ne (quasineutral).
     """
-    # Collisions
-    _, _, nu_e = electron_collision_frequencies(Te, ne, nn, lnLambda, sigma_en_m2, Te_is_eV)
-
     # |B|
     Bmag += B_FLOOR
 
@@ -90,7 +87,7 @@ def electron_conductivities(
 
     return sigma_par_e, sigma_P_e, sigma_H_e, Omega_e/nu_e  # β_e
 
-# Move this solve to 
+# Update solver !
 @numba.jit(nopython=True, parallel=True, nogil=True)
 def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
                br, bz, kappa_parallel, kappa_perp,
@@ -140,7 +137,7 @@ def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
                 br_th = (br[i, j] + br[i, j+1]) / 2.0
                 bz_th = (bz[i, j] + bz[i, j+1]) / 2.0
                 k_par_th = (kappa_parallel[i, j] + kappa_parallel[i, j+1]) / 2.0
-                k_perp_th = (kappa_perp[i, j] + kappa_perp[i+1, j]) / 2.0
+                k_perp_th = (kappa_perp[i, j] + kappa_perp[i, j+1]) / 2.0
                 k_a_th = k_par_th - k_perp_th
                 k_zz_th = k_perp_th + k_a_th * bz_th**2
                 k_rz_th = k_a_th * br_th * bz_th
@@ -168,9 +165,7 @@ def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
                 div_q = div_qr_term + div_qz_term
                 
                 # --- Time Update (Forward Euler) ---
-                rhs = -div_q + Q_Joule
+                rhs = -div_q + Q_Joule[i, j]
                 dTe_dt = (2.0 / (3.0 * n_e[i, j] * constants.kb)) * rhs
                 
                 Te_new[i, j] = Te[i, j] + dt * dTe_dt
-
-    return Te_new

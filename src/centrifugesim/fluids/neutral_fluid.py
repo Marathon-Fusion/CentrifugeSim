@@ -6,14 +6,19 @@ from centrifugesim import constants
 
 class NeutralFluidContainer:
     """
-    Notes:
-    
     """
-    def __init__(self, geom:Geometry, flow_rate, r_max_flow, z_max_flow):
+    def __init__(self, geom:Geometry, nn_floor, mass):
 
         self.Nr = geom.Nr
         self.Nz = geom.Nz
 
-        self.flow_rate = flow_rate
-        self.r_max_flow = r_max_flow
-        self.z_max_flow = z_max_flow
+        self.nn_floor = nn_floor
+        self.mass = mass
+
+        self.nn_grid = np.zeros((self.Nr, self.Nz))
+
+        self.un_r_grid = np.zeros((self.Nr, self.Nz))
+        self.un_theta_grid = np.zeros((self.Nr, self.Nz))
+        self.un_z_grid = np.zeros((self.Nr, self.Nz))
+        
+        self.T_n_grid = np.zeros((self.Nr, self.Nz))
