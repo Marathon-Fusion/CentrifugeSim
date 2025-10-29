@@ -1,4 +1,5 @@
 import numpy as np
+import cupy as cp
 
 from centrifugesim.geometry.geometry import Geometry
 from centrifugesim.field_solver.fem_phi_solver import (
@@ -41,10 +42,14 @@ class HybridPICModel:
         self.bz_grid = np.zeros((self.Nr, self.Nz)) # Bz/Bmag
         self.Bmag_grid = np.zeros((self.Nr, self.Nz))
 
-        # Collision frequencies (placeholders)
-        # Move to particle container?
-        # self.nu_in_grid = np.zeros((self.Nr, self.Nz))
-        # self.nu_cx_grid = np.zeros((self.Nr, self.Nz))
+        # ------- Device fields ---------
+        self.Er_grid_d = cp.zeros((self.Nr, self.Nz)).astype(cp.float64)
+        self.Et_grid_d = cp.zeros((self.Nr, self.Nz)).astype(cp.float64)
+        self.Ez_grid_d = cp.zeros((self.Nr, self.Nz)).astype(cp.float64)
+
+        self.Br_grid_d = cp.zeros((self.Nr, self.Nz)).astype(cp.float64)
+        self.Bt_grid_d = cp.zeros((self.Nr, self.Nz)).astype(cp.float64)
+        self.Bz_grid_d = cp.zeros((self.Nr, self.Nz)).astype(cp.float64)
 
         # --- Precreate FEM coefficient functions
         self.coeffs = init_phi_coeffs(geom)
@@ -62,6 +67,9 @@ class HybridPICModel:
         self.Bmag_grid[:] = np.sqrt(self.Br_grid**2 + self.Bz_grid**2)
         self.br_grid[:] = np.where(self.Bmag_grid==0, 0, self.Br_grid/self.Bmag_grid)
         self.bz_grid[:] = np.where(self.Bmag_grid==0, 0, self.Bz_grid/self.Bmag_grid)
+
+        self.Br_grid_d = cp.asarray(self.Br_grid)
+        self.Bz_grid_d = cp.asarray(self.Bz_grid)
 
     def update_phi_coeffs(self, geom:Geometry, electron_fluid, neutral_fluid):
 
@@ -107,6 +115,10 @@ class HybridPICModel:
         self.Er_grid[np.isnan(self.Er_grid)] = 0
         self.Ez_grid[np.isnan(self.Ez_grid)] = 0
         self.q_ohm_grid[np.isnan(self.q_ohm_grid)] = 0
+
+        # copy E field components to gpu
+        self.Er_grid_d = cp.asarray(self.Er_grid)
+        self.Ez_grid_d = cp.asarray(self.Ez_grid)
 
         self.I_app = sol["integrals"]["I_applied"]
         self.I_sol = sol["integrals"]["I_from_solution"]

@@ -142,15 +142,19 @@ void gatherScalarField(const int N,
         int i0 = (int)floorf(i_float);
         int j0 = (int)floorf(j_float);
         
+        // Clamp indices to ensure that (i0+1) and (j0+1) are valid.
+        if (i0 < 0) i0 = 0;
+        if (i0 > Nr - 2) i0 = Nr - 2;
+        if (j0 < 0) j0 = 0;
+        if (j0 > Nz - 2) j0 = Nz - 2;
+
         // Fractional parts (weights).
         float alpha = i_float - i0;
         float beta  = j_float - j0;
-        
-        // Clamp indices to ensure that (i0+1) and (j0+1) are valid.
-        //if (i0 < 0) i0 = 0;
-        //if (i0 > Nr - 2) i0 = Nr - 2;
-        //if (j0 < 0) j0 = 0;
-        //if (j0 > Nz - 2) j0 = Nz - 2;
+
+        // Saturate local coords to [0,1]
+        alpha = fminf(fmaxf(alpha, 0.0f), 1.0f);
+        beta  = fminf(fmaxf(beta,  0.0f), 1.0f);
         
         // Bilinear weights.
         float w00 = (1.0f - alpha) * (1.0f - beta);
@@ -196,9 +200,19 @@ void depositScalarKernel(const int N,
         int i0 = (int)floorf(i_float);
         int j0 = (int)floorf(j_float);
         
+        // Clamp indices to be within valid range (so that i0+1 and j0+1 are valid).
+        if (i0 < 0) i0 = 0;
+        if (i0 > Nr - 2) i0 = Nr - 2;
+        if (j0 < 0) j0 = 0;
+        if (j0 > Nz - 2) j0 = Nz - 2;
+
         // Fractional parts (weights).
         float alpha = i_float - i0;
         float beta  = j_float - j0;
+
+        // Saturate local coords to [0,1]
+        alpha = fminf(fmaxf(alpha, 0.0f), 1.0f);
+        beta  = fminf(fmaxf(beta,  0.0f), 1.0f);
                 
         // Bilinear weights.
         float w00 = (1.0f - alpha) * (1.0f - beta);

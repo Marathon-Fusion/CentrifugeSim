@@ -7,7 +7,7 @@ from centrifugesim.initialization.init_particles import init_particles_positions
 
 class ParticleContainer:
 
-    def __init__(self, Z, m, name, rmax_p, zmin_p, zmax_p, rmax_BC, zmin_BC, zmax_BC, N, Nr, Nz):
+    def __init__(self, Z, m, name, rmax_BC, zmin_BC, zmax_BC, N, geom):
         
         self.N = N
         self.Z = Z
@@ -16,7 +16,7 @@ class ParticleContainer:
         self.q_m = self.q/m
         self.name = name
         
-        self.rmax_p, self.zmin_p, self.zmax_p = rmax_p, zmin_p, zmax_p
+        self.rmax_p, self.zmin_p, self.zmax_p = geom.rmax, geom.zmin, geom.zmax
 
         self.rmax_BC = rmax_BC
         self.zmin_BC = zmin_BC
@@ -29,20 +29,15 @@ class ParticleContainer:
         self.vt = None
         self.vz = None
 
-        self.weight = None # cp.ones(N).astype(cp.float32)
-
-        # Allocate arrays for particles ids, the id number should be unique to each particle
-        # max_prev_id is used for 
-        # self.id = cp.ones(N).astype(cp.float32)
-        # self.max_prev_id = N
+        self.weight = None
 
         # Allocate arrays for n, Jr, Jt, Jz, T for this species
         # s stands for species
-        self.ns = cp.zeros((Nr, Nz)).astype(cp.float64)
-        self.Js_r = cp.zeros((Nr, Nz)).astype(cp.float64)
-        self.Js_t = cp.zeros((Nr, Nz)).astype(cp.float64)
-        self.Js_z = cp.zeros((Nr, Nz)).astype(cp.float64)
-        self.Ts = cp.zeros((Nr, Nz)).astype(cp.float64)
+        self.ns = cp.zeros((geom.Nr, geom.Nz)).astype(cp.float64)
+        self.Js_r = cp.zeros((geom.Nr, geom.Nz)).astype(cp.float64)
+        self.Js_t = cp.zeros((geom.Nr, geom.Nz)).astype(cp.float64)
+        self.Js_z = cp.zeros((geom.Nr, geom.Nz)).astype(cp.float64)
+        self.Ts = cp.zeros((geom.Nr, geom.Nz)).astype(cp.float64)
 
         print(self.name + " initialized")
 
@@ -71,7 +66,7 @@ class ParticleContainer:
                        Bp_r, Bp_t, Bp_z))
          
       
-    def PushX(self, dt):
+    def PushX(self, geom, dt):
         
         # Calculate the components of the new position vector
         # (as if in a local Cartesian frame x' = r + vr*dt, y' = vt*dt)
@@ -79,23 +74,14 @@ class ParticleContainer:
         t_component = self.vt*dt
 
         # Update r and z position
-        self.r += self.vr*dt
         self.z += self.vz*dt
-
-        ind_r0 = cp.flatnonzero(self.r<0)
-        if(ind_r0.shape[0]>0):
-            self.r[ind_r0] = cp.abs(self.r[ind_r0])
-            self.vr[ind_r0] = cp.abs(self.vr[ind_r0])
         
         # Calculate the new radial magnitude
         r_new = cp.sqrt(r_component**2 + t_component**2)
-        
-        # Epsilon for numerical stability to avoid division by zero at r=0
-        epsilon = 1e-35
-        
+                
         # Calculate sin and cos of the rotation angle
-        cos_alpha = r_component / (r_new + epsilon)
-        sin_alpha = t_component / (r_new + epsilon)
+        cos_alpha = r_component / r_new 
+        sin_alpha = t_component / r_new
 
         # Copy old velocities for rotation
         vr_old = cp.copy(self.vr)
@@ -104,31 +90,28 @@ class ParticleContainer:
         # Apply rotation to get velocity components in the new basis
         self.vr[:] = cos_alpha*vr_old + sin_alpha*vt_old
         self.vt[:] = -sin_alpha*vr_old + cos_alpha*vt_old
-                
-        self.ApplyBCparticles(self.rmax_p, self.zmin_p, self.zmax_p, dt)
+
+        self.r[:] = r_new
+        
+        self.ApplyBCparticles(geom, self.rmax_p, self.zmin_p, self.zmax_p)
 
 
-    def ApplyBCparticles(self, rmax, zmin, zmax, dt):
+    def ApplyBCparticles(self, geom, rmax, zmin, zmax):
         L = zmax-zmin
 
         # check particles with r<0
         ind_r0 = cp.flatnonzero(self.r<0)
         if(ind_r0.shape[0]>0):
             self.r[ind_r0] = cp.abs(self.r[ind_r0])
-            self.vr[ind_r0] = cp.abs(self.vr[ind_r0])
-            #self.vt[ind_r0] = -self.vt[ind_r0] # CHECK
+            self.vr[ind_r0] = -self.vr[ind_r0]
+            self.vt[ind_r0] = -self.vt[ind_r0]
 
-        # check BC at rmax
-            # Modify this to check at a given z if a particle is outside of the domain
-            # for geometries with variable r(z) BC for particles. Set ID of particle to negative or invalid value
-            # then call the particle scrapper routine to remove invalid particles.
-            # kernel should be able to interpolate to the z position of particle what is the r(z) of wall
-            # and compare with r position of particle.
+        # check particles with r>rmax
         ind_rmax = cp.flatnonzero(self.r>rmax)
         if(ind_rmax.shape[0]>0):
 
             if(self.rmax_BC=="reflecting"):
-                self.r[ind_rmax] = rmax
+                self.r[ind_rmax]  = 2.0*rmax - self.r[ind_rmax]
                 self.vr[ind_rmax] = -self.vr[ind_rmax]
 
             elif(self.rmax_BC=="absorbing"):
@@ -141,7 +124,7 @@ class ParticleContainer:
 
             if(self.zmin_BC=="reflecting"):
                 self.z[ind_zmin] = zmin
-                self.vz[ind_zmin] = -self.vz[ind_zmin]
+                self.vz[ind_zmin] = cp.abs(self.vz[ind_zmin])
 
             elif(self.zmin_BC=="absorbing"):
                 self.remove_indices_and_free_memory(ind_zmin)
@@ -156,7 +139,7 @@ class ParticleContainer:
 
             if(self.zmax_BC=="reflecting"):
                 self.z[ind_zmax] = zmax
-                self.vz[ind_zmax] = -self.vz[ind_zmax]
+                self.vz[ind_zmax] = -cp.abs(self.vz[ind_zmax])
 
             elif(self.zmax_BC=="absorbing"):
                 self.remove_indices_and_free_memory(ind_zmax)
@@ -164,34 +147,39 @@ class ParticleContainer:
             elif(self.zmax_BC=="periodic"):
                 self.z[ind_zmax] -= L
 
+        # check if particles are asorbed at cathode:
+        ind_cathode = cp.flatnonzero(cp.logical_and(self.r<=geom.rmax_cathode,self.z<=geom.zmax_cathode))
+        if(ind_cathode.shape[0]>0):
+            self.remove_indices_and_free_memory(ind_cathode)
 
-    def gatherEandB(self, Er, Et, Ez, Br, Bt, Bz, dr, dz, zmin):
+        # check if particles are absorbed at first anode:
+        ind_anode_1 = cp.flatnonzero(cp.logical_and(self.r>=geom.rmin_anode,
+                        cp.logical_and(self.z>=geom.zmin_anode,self.z<=geom.zmax_anode)))
+        if(ind_anode_1.shape[0]>0):
+            self.remove_indices_and_free_memory(ind_anode_1)
 
+        # check if particles are absorbed at second anode:
+        dz_anode = geom.zmax_anode - geom.zmin_anode
+        ind_anode_2 = cp.flatnonzero(cp.logical_and(self.r>=geom.rmin_anode,
+                        cp.logical_and(self.z>=geom.zmin_anode2,self.z<=geom.zmin_anode2+dz_anode)))
+        if(ind_anode_2.shape[0]>0):
+            self.remove_indices_and_free_memory(ind_anode_2)
+
+
+    def gatherEandB(self, Er, Et, Ez, Br, Bt, Bz, geom):
+        """
+        Gather function from cartesian rz mesh to particles positions.
+        Only gathering r and z components of E and B fields
+        """
         threads_per_block = 256
         blocks = (self.N + threads_per_block - 1) // threads_per_block
 
         Nr = Er.shape[0]
         Nz = Er.shape[1]
 
-        Ep_r, Ep_t, Ep_z = (cp.zeros_like(self.r) for _ in range(3))
-        Bp_r, Bp_t, Bp_z = (cp.zeros_like(self.r) for _ in range(3))
-
-        particle_container_kernels.gatherEandBKernel((blocks,), (threads_per_block,),
-                       (self.N, Nr, Nz, np.float32(dr), np.float32(dz), np.float32(zmin), self.r, self.z,
-                        Er.astype(cp.float32), Et.astype(cp.float32), Ez.astype(cp.float32), 
-                        Br.astype(cp.float32), Bt.astype(cp.float32), Bz.astype(cp.float32),
-                        Ep_r, Ep_t, Ep_z, Bp_r, Bp_t, Bp_z))
-        
-        return Ep_r, Ep_t, Ep_z, Bp_r, Bp_t, Bp_z
-    
-
-    def gatherEandB_v2(self, Er, Et, Ez, Br, Bt, Bz, dr, dz, zmin):
-
-        threads_per_block = 256
-        blocks = (self.N + threads_per_block - 1) // threads_per_block
-
-        Nr = Er.shape[0]
-        Nz = Er.shape[1]
+        dr = geom.dr
+        dz = geom.dz
+        zmin = geom.zmin
 
         Ep_r, Ep_t, Ep_z = (cp.zeros_like(self.r) for _ in range(3))
         Bp_r, Bp_t, Bp_z = (cp.zeros_like(self.r) for _ in range(3))
@@ -200,11 +188,7 @@ class ParticleContainer:
         particle_container_kernels.gatherScalarField((blocks,), (threads_per_block,),
                        (self.N, Nr, Nz, np.float32(dr), np.float32(dz), np.float32(zmin), self.r, self.z,
                         Er.astype(cp.float32), Ep_r))
-        
-        particle_container_kernels.gatherScalarField((blocks,), (threads_per_block,),
-                       (self.N, Nr, Nz, np.float32(dr), np.float32(dz), np.float32(zmin), self.r, self.z,
-                        Et.astype(cp.float32), Ep_t))
-        
+                
         particle_container_kernels.gatherScalarField((blocks,), (threads_per_block,),
                        (self.N, Nr, Nz, np.float32(dr), np.float32(dz), np.float32(zmin), self.r, self.z,
                         Ez.astype(cp.float32), Ep_z))
@@ -213,11 +197,7 @@ class ParticleContainer:
         particle_container_kernels.gatherScalarField((blocks,), (threads_per_block,),
                        (self.N, Nr, Nz, np.float32(dr), np.float32(dz), np.float32(zmin), self.r, self.z,
                         Br.astype(cp.float32), Bp_r))
-        
-        particle_container_kernels.gatherScalarField((blocks,), (threads_per_block,),
-                       (self.N, Nr, Nz, np.float32(dr), np.float32(dz), np.float32(zmin), self.r, self.z,
-                        Bt.astype(cp.float32), Bp_t))
-        
+            
         particle_container_kernels.gatherScalarField((blocks,), (threads_per_block,),
                        (self.N, Nr, Nz, np.float32(dr), np.float32(dz), np.float32(zmin), self.r, self.z,
                         Bz.astype(cp.float32), Bp_z))
@@ -262,8 +242,10 @@ class ParticleContainer:
         return field
 
 
-    def depositNandJ(self, volume_field, dr, dz, zmin):
-        Nr, Nz = volume_field.shape
+    def depositNandJ(self, geom):
+        Nr, Nz = geom.Nr, geom.Nz
+        dr, dz, zmin = geom.dr, geom.dz, geom.zmin
+        volume_field = geom.volume_field
 
         volume_field_d = cp.asarray(volume_field)
 
@@ -287,6 +269,10 @@ class ParticleContainer:
         self.ns[:,0] = self.ns[:,1]
         self.ns[:,Nz-1] = self.ns[:,Nz-2]
 
+        # change to verboncour
+        self.ns[0,:] = self.ns[1,:]
+        self.ns[Nr-1,:] = self.ns[Nr-2,:]
+
         self.Js_r[:,0] = self.Js_r[:,1]
         self.Js_r[:,Nz-1] = self.Js_r[:,Nz-2]
 
@@ -295,9 +281,6 @@ class ParticleContainer:
 
         self.Js_z[:,0] = self.Js_z[:,1]
         self.Js_z[:,Nz-1] = self.Js_z[:,Nz-2]
-
-        return self.ns, self.Js_r, self.Js_t, self.Js_z
-
 
     def depositTemperature_dim(self, u_field, vp, dr, dz, zmin, Nr, Nz):
 
@@ -317,10 +300,9 @@ class ParticleContainer:
 
         return Ts_dim
     
+    def depositTemperature(self, n_floor, geom):
+        dr, dz, zmin, Nr, Nz = geom.dr, geom.dz, geom.zmin, geom.Nr, geom.Nz
 
-    # Should try doing this in a kernel (with 1 single pass to calculate everything)
-    # Look at Eric's implementation of variance deposition in warpx!
-    def depositTemperature(self, n_floor, dr, dz, zmin, Nr, Nz):
         rho_limited = cp.where(self.ns<n_floor, n_floor, self.ns)*self.q
         ur = (self.Js_r/rho_limited).astype(cp.float32)
         ut = (self.Js_t/rho_limited).astype(cp.float32)
@@ -331,6 +313,7 @@ class ParticleContainer:
         Ts_z = self.depositTemperature_dim(uz, self.vz, dr, dz, zmin, Nr, Nz)
 
         self.Ts = (Ts_r + Ts_t + Ts_z) / 3.0
+        self.Ts = cp.where(self.ns<n_floor, 0, self.Ts)
 
     def remove_invalid_particles(self):
         ind_invalid = cp.flatnonzero(self.id<0)
@@ -356,15 +339,6 @@ class ParticleContainer:
         # Free unused memory blocks
         cp._default_memory_pool.free_all_blocks()
 
-    """
-    # Update this ! currently calling in cpu not here
-    def apply_bilinear_filter(self):
-        self.ns = bilinear_filter(self.ns)
-        self.Js_r = bilinear_filter(self.Js_r)
-        self.Js_t = bilinear_filter(self.Js_t)
-        self.Js_z = bilinear_filter(self.Js_z)
-    """
-
     def copy_fields_to_host(self):
         ns = cp.asnumpy(self.ns)
         Js_r = cp.asnumpy(self.Js_r)
@@ -372,7 +346,6 @@ class ParticleContainer:
         Js_z = cp.asnumpy(self.Js_z)
         return ns, Js_r, Js_t, Js_z
     
-    # TO DO: Add ids too ! so I can do particle scrapper calls to remove particles with negative id.
     def add_N_particles(self, 
                         r_new, z_new, 
                         vr_new, vt_new, vz_new,
@@ -395,77 +368,8 @@ class ParticleContainer:
             self.weight = cp.concatenate((self.weight, w_new)).astype(cp.float32)
             self.N=self.r.shape[0]
 
-    def add_plasma_uniform_density(
-        self,
-        nr: int,
-        r_min: float,
-        r_max: float,
-        z_min: float,
-        z_max: float,
-        dr: float,
-        dz: float,
-        density: float,
-        vth_i: float,
-        w: int = None,
-        np_per_cell: int = None,
-        seed: int = None,
-    ) -> None:
-        """
-        Add plasma particles with uniform density to the simulation.
-
-        Parameters
-        ----------
-        self : object
-            Simulation instance.
-        np_per_cell : int
-            Number of particles per cell.
-        weight : int
-            weight of macroparticles
-        r_min, r_max : float
-            Radial bounds for particle addition.
-        z_min, z_max : float
-            Axial (z) bounds for particle addition.
-        dr, dz : float
-            Grid spacing in the radial and axial directions.
-        density : float
-            Physical particle density (particles per unit volume).
-        vth_i : float
-            Ion thermal velocity for sampling.
-        seed : int, optional
-            Seed for reproducibility.
-        """
-        Np, r_pos, z_pos, weights = init_particles_positions_and_weights(
-            nr,
-            r_min,
-            r_max,
-            z_min,
-            z_max,
-            dr,
-            dz,
-            density,
-            w,
-            np_per_cell,
-            seed,
-        )
-
-        # Transfer to GPU and sample velocities
-        r_new = cp.asarray(r_pos, dtype=cp.float32)
-        z_new = cp.asarray(z_pos, dtype=cp.float32)
-        vr_new = cp.random.normal(0, vth_i, size=Np).astype(cp.float32)
-        vt_new = cp.random.normal(0, vth_i, size=Np).astype(cp.float32)
-        vz_new = cp.random.normal(0, vth_i, size=Np).astype(cp.float32)
-        w_new = cp.asarray(weights, dtype=cp.float32)
-
-        self.add_N_particles(
-            r_new=r_new,
-            z_new=z_new,
-            vr_new=vr_new,
-            vt_new=vt_new,
-            vz_new=vz_new,
-            w_new=w_new,
-        )
-
     def add_from_numpy_arrays(self,
+                              geom,
                               w_p,
                               r_p, z_p,
                               vr_p, vt_p, vz_p):
@@ -486,7 +390,7 @@ class ParticleContainer:
             w_new=w_new,
         )
 
-        self.ApplyBCparticles(self.rmax_p, self.zmin_p, self.zmax_p, 0)
+        self.ApplyBCparticles(geom, self.rmax_p, self.zmin_p, self.zmax_p)
 
     def drag_diffusion(self,
                        Uer, Uet, Uez,
