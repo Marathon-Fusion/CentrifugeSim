@@ -3,7 +3,8 @@ import cupy as cp
 
 import centrifugesim.constants as constants
 from . import particle_container_kernels
-from centrifugesim.initialization.init_particles import init_particles_positions_and_weights
+
+from centrifugesim.initialization.init_particles import initialize_ions_from_ni_nppc
 
 class ParticleContainer:
 
@@ -39,6 +40,10 @@ class ParticleContainer:
         self.Js_z = cp.zeros((geom.Nr, geom.Nz)).astype(cp.float64)
         self.Ts = cp.zeros((geom.Nr, geom.Nz)).astype(cp.float64)
 
+        self.us_r_host = np.zeros((geom.Nr, geom.Nz)).astype(np.float64)
+        self.us_t_host = np.zeros((geom.Nr, geom.Nz)).astype(np.float64)
+        self.us_z_host = np.zeros((geom.Nr, geom.Nz)).astype(np.float64)
+
         print(self.name + " initialized")
 
 
@@ -53,6 +58,16 @@ class ParticleContainer:
 
         self.weight = cp.copy(w_init).astype(cp.float32)
        
+    def compute_u(self, n_floor):
+        rho_s_host = cp.asnumpy(self.ns)*self.q
+        rho_floor = n_floor*self.q
+        Js_r_host = cp.asnumpy(self.Js_r)
+        Js_t_host = cp.asnumpy(self.Js_t)
+        Js_z_host = cp.asnumpy(self.Js_z)
+
+        self.us_r_host = np.where(rho_s_host<rho_floor, 0, Js_r_host/rho_s_host)
+        self.us_t_host = np.where(rho_s_host<rho_floor, 0, Js_t_host/rho_s_host)
+        self.us_z_host = np.where(rho_s_host<rho_floor, 0, Js_z_host/rho_s_host)
 
     def BorisPush(self, Ep_r, Ep_t, Ep_z, Bp_r, Bp_t, Bp_z, dt):
 
@@ -428,3 +443,41 @@ class ParticleContainer:
             self.vr[ind] += dvr_
             self.vt[ind] += dvt_
             self.vz[ind] += dvz_
+
+    def reset_particles(self, geom, nppc):
+        """
+        This function removes all the ions in the domain and create new ones 
+        recreating the n, T, ur, ut, uz fields with a given new nppc.
+        This should not be used often since it forces the IVDF to be Maxwellian (+ some pre existing drift)
+        which is equivalent to adding a collision operator with a frequency given by 1/dt_call where
+        dt_call is the time interval between consecutive reset_particles calls.
+        A particle merge algorithm should be used instead if particles are expected to have non Maxwellian distributions
+        but it would increase the computational cost.
+        """
+        # Remove all particles
+        self.remove_indices_and_free_memory(cp.arange(self.N))
+
+        # Create new ones with set nppc and last deposited fields
+        ns, Js_r, Js_t, Js_z = self.copy_fields_to_host()
+        Ts = cp.asnumpy(self.Ts)
+
+        # create numpy arrays for new particles from ni, Ti fields with set nppc
+        w_p, r_p, z_p, vr_p, vt_p, vz_p = initialize_ions_from_ni_nppc(ns, Ts, geom.R, geom.Z, geom.dr, geom.dz, nppc, self.m)
+
+        # add particles to container
+        self.add_from_numpy_arrays(geom, w_p, r_p, z_p, vr_p, vt_p, vz_p)
+
+        # Add drift velocities to particles
+        uir_grid_device = cp.asarray(self.us_r_host).astype(cp.float32)
+        uit_grid_device = cp.asarray(self.us_t_host).astype(cp.float32)
+        uiz_grid_device = cp.asarray(self.us_z_host).astype(cp.float32)
+        ui_r =  self.gatherScalarField(uir_grid_device, geom.dr, geom.dz, geom.zmin)
+        ui_t =  self.gatherScalarField(uit_grid_device, geom.dr, geom.dz, geom.zmin)
+        ui_z =  self.gatherScalarField(uiz_grid_device, geom.dr, geom.dz, geom.zmin)
+        self.vr += ui_r.astype(cp.float32)
+        self.vt += ui_t.astype(cp.float32)
+        self.vz += ui_z.astype(cp.float32)
+
+        del uir_grid_device, uit_grid_device, uiz_grid_device
+        del ui_r, ui_t, ui_z
+        cp._default_memory_pool.free_all_blocks()
