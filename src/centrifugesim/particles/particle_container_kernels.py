@@ -238,3 +238,78 @@ void depositScalarKernel(const int N,
     }
 }
 ''', "depositScalarKernel")
+
+
+mccKernel = cp.RawKernel(r'''
+extern "C" __global__
+void mccKernel(
+    const float* __restrict__ vr,    // ion velocities in
+    const float* __restrict__ vt,
+    const float* __restrict__ vz,
+    const float* __restrict__ unr,   // local neutral bulk velocity components
+    const float* __restrict__ unt,
+    const float* __restrict__ unz,
+    const float* __restrict__ nn,    // local neutral density
+    const float* __restrict__ Tn,    // local neutral temperature
+    const float* __restrict__ rcoll, // U[0,1] for collision acceptance
+    const float* __restrict__ rbeta, // U[0,1] for scattering polar angle
+    const float* __restrict__ rphi,  // U[0,1] for scattering azimuth
+    const float* __restrict__ g1,    // N(0,1) for neutral thermal vx
+    const float* __restrict__ g2,    // N(0,1) for neutral thermal vy
+    const float* __restrict__ g3,    // N(0,1) for neutral thermal vz
+    float* __restrict__ vr_out,      // ion velocities out
+    float* __restrict__ vt_out,
+    float* __restrict__ vz_out,
+    const double dt,                  // time step
+    const double sigma_mt,            // momentum-transfer cross section (m^2)
+    const double m_i,                 // ion mass (kg)
+    const double m_n,                 // neutral mass (kg)
+    const double kB,                  // Boltzmann constant (J/K)
+    const long long N                 // number of particles
+){
+    long long i = blockDim.x * (long long)blockIdx.x + threadIdx.x;
+    if (i >= N) return;
+
+    // sample neutral Maxwellian about local bulk flow
+    double vth = sqrt(kB * Tn[i] / m_n);
+    double vnr = unr[i] + vth * g1[i];
+    double vnt = unt[i] + vth * g2[i];
+    double vnz = unz[i] + vth * g3[i];
+
+    // relative velocity
+    double ur = vr[i] - vnr;
+    double ut = vt[i] - vnt;
+    double uz = vz[i] - vnz;
+    double umag = sqrt(ur*ur + ut*ut + uz*uz) + 1e-30;
+
+    // collision probability and accept/reject
+    double P = 1.0 - exp(- nn[i] * sigma_mt * umag * dt);
+    if (rcoll[i] < P){
+        // unitary u
+        double e1r = ur / umag;
+        double e1t = ut / umag;
+        double e1z = uz / umag;
+
+        // isotropic scattering of relative velocity direction
+        double cosb = 1.0 - 2.0 * rbeta[i];               // cos(beta)
+        double sinb = sqrt(fmax(0.0, 1.0 - cosb*cosb));
+        double phi  = 6.283185307179586 * rphi[i];        // 2*pi*rphi
+        double cphi = cos(phi), sphi = sin(phi);
+
+        // new relative velocity u' with same magnitude
+        double dur = umag * ( sinb*cphi - (1-cosb)*e1r );
+        double dut = umag * ( sinb*sphi - (1-cosb)*e1t );
+        double duz = umag * ( -(1-cosb)*e1z );
+
+        double factor = m_n / (m_i + m_n);
+
+        vr_out[i] = vr[i] + factor * dur;
+        vt_out[i] = vt[i] + factor * dut;
+        vz_out[i] = vz[i] + factor * duz;
+    } else {
+        vr_out[i] = vr[i];
+        vt_out[i] = vt[i];
+        vz_out[i] = vz[i];
+    }
+}
+''', "mccKernel")
