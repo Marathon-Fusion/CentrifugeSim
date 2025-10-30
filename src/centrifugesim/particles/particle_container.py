@@ -481,3 +481,108 @@ class ParticleContainer:
         del uir_grid_device, uit_grid_device, uiz_grid_device
         del ui_r, ui_t, ui_z
         cp._default_memory_pool.free_all_blocks()
+
+
+    def collide_with_neutrals_mcc(
+        self,
+        geom,
+        Tn_host, nn_host,
+        un_r_host, un_t_host, un_z_host,
+        m_n,
+        dt,
+        sigma_mt=5e-19,
+        seed=None
+    ):
+        """
+        Monte-Carlo collisions with background neutrals.
+
+        Parameters
+        ----------
+        Tn_host : np.ndarray, shape (Nr,Nz), float64
+            Neutral temperature field [K] on host.
+        nn_host : np.ndarray, shape (Nr,Nz), float64
+            Neutral number density field [m^-3] on host.
+        un_r_host, un_theta_host, un_z_host : np.ndarray (Nr,Nz), float64
+            Neutral bulk velocity components [m/s] on host, cylindrical components.
+        m_n : float
+            Neutral mass [kg].
+        sigma_mt : float, optional
+            Momentum-transfer cross-section [m^2]. Default 5e-19.
+        seed : int or None
+            RNG seed for reproducibility of collision sampling.
+
+        Notes
+        -----
+        * Uses P_coll = 1 - exp(-nn * sigma_mt * u * dt) with u = |v_i - v_n|.
+        * Samples one neutral velocity from a Maxwellian at local Tn and bulk (u_n) per ion.
+        * Performs isotropic scattering of the relative velocity.
+        * Ion velocity update: v_i <- v_i + (m_n/(m_i+m_n)) * Δu    (matches 1/2 for Ar^+–Ar).
+        """
+        # check number of ions
+        N = self.N
+        if N == 0:
+            return  # nothing to do
+
+        m_i = float(self.m)
+
+        Tn_device = cp.asarray(Tn_host).astype(cp.float32)
+        nn_device = cp.asarray(nn_host).astype(cp.float32)
+        un_r_device = cp.asarray(un_r_host).astype(cp.float32)
+        un_t_device = cp.asarray(un_t_host).astype(cp.float32)
+        un_z_device = cp.asarray(un_z_host).astype(cp.float32)
+
+        # Gather local neutral state at particle positions
+        Tn_loc = self.gatherScalarField(Tn_device, geom.dr, geom.dz, geom.zmin)     # [K]      
+        nn_loc = self.gatherScalarField(nn_device, geom.dr, geom.dz, geom.zmin)     # [m^-3]
+        unr_loc = self.gatherScalarField(un_r_device, geom.dr, geom.dz, geom.zmin)  # [m/s]
+        unt_loc = self.gatherScalarField(un_t_device, geom.dr, geom.dz, geom.zmin)  # [m/s]
+        unz_loc = self.gatherScalarField(un_z_device, geom.dr, geom.dz, geom.zmin)  # [m/s]
+
+        # Output buffers (in-place is fine, but separate arrays keep it safe)
+        vr_out = cp.empty_like(self.vr)
+        vt_out = cp.empty_like(self.vt)
+        vz_out = cp.empty_like(self.vz)
+
+        # Random numbers: generate with NumPy then move to CuPy (as requested)
+        rcoll = cp.random.rand(N, dtype=cp.float32)     # collision acceptance
+        rbeta = cp.random.rand(N, dtype=cp.float32)     # for cos(beta) = 1 - 2 R1
+        rphi  = cp.random.rand(N, dtype=cp.float32)     # for phi = 2*pi*R2
+        g1    = cp.random.randn(N, dtype=cp.float32)    # Gaussian for neutral thermal vx
+        g2    = cp.random.randn(N, dtype=cp.float32)    # Gaussian for neutral thermal vy
+        g3    = cp.random.randn(N, dtype=cp.float32)    # Gaussian for neutral thermal vz
+
+        # Launch kernel
+        threads_per_block = 256
+        blocks = (self.N + threads_per_block - 1) // threads_per_block
+
+        particle_container_kernels.mccKernel(
+            (blocks,), (threads_per_block,),
+            (
+                self.vr, self.vt, self.vz,
+                unr_loc, unt_loc, unz_loc,
+                nn_loc, Tn_loc,
+                rcoll, rbeta, rphi,
+                g1, g2, g3,
+                vr_out, vt_out, vz_out,
+                np.float64(dt),
+                np.float64(sigma_mt),
+                np.float64(m_i),
+                np.float64(m_n),
+                np.float64(constants.kb),
+                np.int64(N),
+            )
+        )
+
+        # Write back updated velocities
+        self.vr[...] = vr_out
+        self.vt[...] = vt_out
+        self.vz[...] = vz_out
+
+        # del and free memory
+        del vr_out, vt_out, vz_out
+        del g1, g2, g3
+        del rcoll, rbeta, rphi
+        del Tn_loc, nn_loc, unr_loc, unt_loc, unz_loc
+        del Tn_device, nn_device
+        del un_r_device, un_t_device, un_z_device
+        cp._default_memory_pool.free_all_blocks()
