@@ -29,8 +29,9 @@ class ElectronFluidContainer:
         self.Te_grid = np.zeros((geom.Nr,geom.Nz)).astype(np.float64) # [K] !
         self.Te_grid_prev = np.zeros((geom.Nr,geom.Nz)).astype(np.float64) # [K] !
 
-
         self.pe_grid = np.zeros((geom.Nr,geom.Nz)).astype(np.float64) # [Pa] !
+        self.grad_pe_grid_r = np.zeros((geom.Nr,geom.Nz)).astype(np.float64) # [Pa/m] !
+        self.grad_pe_grid_z = np.zeros((geom.Nr,geom.Nz)).astype(np.float64) # [Pa/m] !
 
         self.nu_ei_grid = np.zeros((geom.Nr,geom.Nz)).astype(np.float64)
         self.nu_en_grid = np.zeros((geom.Nr,geom.Nz)).astype(np.float64)
@@ -47,6 +48,28 @@ class ElectronFluidContainer:
 
     def update_pressure(self):
         self.pe_grid = constants.kb*self.Te_grid*self.ne_grid
+
+    def compute_grad_r(self, geom, field):
+        grad_field_r = np.gradient(field, geom.r, axis=0)
+        grad_field_r[geom.mask==0] = 0
+        grad_field_r[int(geom.rmax_cathode/geom.dr)+1,:int(geom.zmax_cathode/geom.dz)+1] = 0
+        grad_field_r[int(geom.rmin_anode/geom.dr),int(geom.zmin_anode/geom.dz)+1:int(geom.zmax_anode/geom.dz)+1] = 0
+        grad_field_r[int(geom.rmin_anode/geom.dr),int(geom.zmin_anode2/geom.dz)+1:int((geom.zmax_anode-geom.zmin_anode+geom.zmin_anode2)/geom.dz)+1] = 0
+        return grad_field_r
+
+    def compute_grad_z(self, geom, field):
+        grad_field_z = np.gradient(field, geom.z, axis=1)
+        grad_field_z[geom.mask==0] = 0
+        grad_field_z[:int(geom.rmax_cathode/geom.dr)+1,int(geom.zmax_cathode/geom.dz)+1] = 0
+        grad_field_z[int(geom.rmin_anode/geom.dr):,int(geom.zmin_anode/geom.dz)] = 0
+        grad_field_z[int(geom.rmin_anode/geom.dr):,int(geom.zmax_anode/geom.dz)+1] = 0
+        grad_field_z[int(geom.rmin_anode/geom.dr):,int(geom.zmin_anode2/geom.dz)] = 0
+        grad_field_z[int(geom.rmin_anode/geom.dr):,int((geom.zmax_anode-geom.zmin_anode+geom.zmin_anode2)/geom.dz)+1] = 0
+        return grad_field_z
+
+    def compute_grad_pe(self, geom):
+        self.grad_pe_grid_r = self.compute_grad_r(geom, self.pe_grid)
+        self.grad_pe_grid_z = self.compute_grad_z(geom, self.pe_grid)
 
     def set_kappa(self, hybrid_pic):
         """

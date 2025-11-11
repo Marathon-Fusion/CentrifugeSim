@@ -96,8 +96,9 @@ def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
     Advances the electron temperature Te by one time step DT.
     Uses an explicit, cell-centered finite difference scheme.
     The energy equation is only solved where mask == 1.
-    Should improve this to reduce number of steps needed, explicit Euler for now
-    just for testing, do not use for production runs.
+    Explicit Euler for now just for testing, do not use for production runs.
+    TO DO:
+    Change to Douglas-ADI to get unconditionally stable behavior and larger timestep size.
     """
     NR, NZ = Te.shape
 

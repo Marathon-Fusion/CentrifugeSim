@@ -1,5 +1,5 @@
 import numpy as np
-from typing import Dict
+from typing import Dict, Tuple, List
 
 # --- DOLFINx/GMsh physical tags we will use on the FEM mesh ---
 G_DOMAIN    = 11
@@ -56,6 +56,7 @@ class Geometry:
         self.zmin_anode = float(zmin_anode)
         self.zmax_anode = float(zmax_anode)
         self.zmin_anode2 = float(zmin_anode2)
+        self.zmax_anode2 = float(zmin_anode2+zmax_anode-zmin_anode)
         
         self.anode1_mask = (
             (self.r[:, None] >= self.rmin_anode) & (self.r[:, None] <= self.rmax_anode) &
@@ -82,6 +83,9 @@ class Geometry:
         self.mask[self.cathode_mask] = 0
         self.mask[self.anode1_mask] = 0
         self.mask[self.anode2_mask] = 0
+
+        # find arrays with valid nodes right next to masked ones.
+        self.i_bc_list, self.j_bc_list = self.find_boundary_nodes()
 
         # Cathode and anode temperatures
         self.temperature_cathode = temperature_cathode
@@ -210,7 +214,44 @@ class Geometry:
         volume_r[Nr - 1] = np.pi * ((Nr - 1) - 1.0 / 3.0) * dr * dr * dz
 
         return np.repeat(volume_r[:, None], Nz, axis=1)
-    
+
+    def find_boundary_nodes(self):
+        """
+        Finds fluid nodes (mask == 1) that are adjacent to at least one
+        solid node (mask == 0) using explicit Python loops.
+        """
+        mask = self.mask
+        Nr, Nz = self.Nr, self.Nz
+        
+        i_bc_list: List[int] = []
+        j_bc_list: List[int] = []
+        
+        # Define the 4-way neighbor relative coordinates (up, down, left, right)
+        neighbors = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, 1), (1, -1)]
+        
+        for i in range(self.Nr):
+            for j in range(self.Nz):
+                # Condition 1: Must be a fluid node
+                if self.mask[i, j] == 1:
+                    is_boundary = False
+                    
+                    # Condition 2: Check all 4 neighbors
+                    for di, dj in neighbors:
+                        ni, nj = i + di, j + dj
+                        
+                        # Check if the neighbor is *within the grid bounds*
+                        if 0 <= ni < self.Nr and 0 <= nj < self.Nz:
+                            # If neighbor is within bounds, check if it's solid
+                            if self.mask[ni, nj] == 0:
+                                is_boundary = True
+                                # Found one, no need to check other neighbors
+                                break 
+                                
+                    if is_boundary:
+                        i_bc_list.append(i)
+                        j_bc_list.append(j)
+                            
+        return np.array(i_bc_list), np.array(j_bc_list)  
 
     def build_fem_mesh(
         self,

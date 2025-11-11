@@ -72,16 +72,11 @@ class HybridPICModel:
         self.Bz_grid_d = cp.asarray(self.Bz_grid)
 
     def update_phi_coeffs(self, geom:Geometry, electron_fluid, neutral_fluid):
-
-        # Forcing pe to be 0 for this solver so it does not blow up
-        # Need to calculate grad_pe before and set to 0 at mask face boundaries
-        ne_aux_grid = np.copy(electron_fluid.ne_grid)
-        Te_aux_grid = 0*electron_fluid.Te_grid
-
         update_phi_coeffs_from_grids(
             geom, self.coeffs,
-            ne_grid=ne_aux_grid,
-            Te_grid=Te_aux_grid,
+            ne_grid=electron_fluid.ne_grid,
+            grad_pe_grid_r=electron_fluid.grad_pe_grid_r,
+            grad_pe_grid_z=electron_fluid.grad_pe_grid_z,
             sigma_parallel_grid=electron_fluid.sigma_parallel_grid,
             sigma_P_grid=electron_fluid.sigma_P_grid,
             sigma_H_grid=electron_fluid.sigma_H_grid,
@@ -115,6 +110,13 @@ class HybridPICModel:
         self.Er_grid[np.isnan(self.Er_grid)] = 0
         self.Ez_grid[np.isnan(self.Ez_grid)] = 0
         self.q_ohm_grid[np.isnan(self.q_ohm_grid)] = 0
+
+        # ensure proper axis behavior
+        self.Er_grid[0,:] = 0
+        self.Jer_grid[0,:] = 0
+
+        self.Ez_grid[0,:] = self.Ez_grid[1,:]
+        self.Jez_grid[0,:] = self.Jez_grid[1,:]
 
         # copy E field components to gpu
         self.Er_grid_d = cp.asarray(self.Er_grid)
