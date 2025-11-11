@@ -362,7 +362,8 @@ def init_phi_coeffs(geom):
     def F(name): return fem.Function(V, name=name)
 
     coeffs = {
-        "pe": F("pe"),
+        "grad_pe_r": F("grad_pe_r"),
+        "grad_pe_z": F("grad_pe_z"),
         "ne": F("ne"),
         "inv_e_ne": F("inv_e_ne"),
         "sigma_parallel": F("sigma_parallel"),
@@ -382,9 +383,9 @@ def init_phi_coeffs(geom):
 def update_phi_coeffs_from_grids(
     geom, coeffs: dict,
     *,
-    pe_grid: np.ndarray | None = None,
     ne_grid: np.ndarray | None = None,
-    Te_grid: np.ndarray | None = None,
+    grad_pe_grid_r: np.ndarray | None = None,
+    grad_pe_grid_z: np.ndarray | None = None,
     sigma_parallel_grid: np.ndarray | None = None,
     sigma_P_grid: np.ndarray | None = None,
     sigma_H_grid: np.ndarray | None = None,
@@ -397,11 +398,8 @@ def update_phi_coeffs_from_grids(
     Uses the cached bilinear assigner; no point-location is performed here.
     """
     # --- pressure / electron --- #
-    if pe_grid is None:
-        if (ne_grid is None) or (Te_grid is None):
-            raise ValueError("Provide either pe_grid, or both ne_grid and Te_grid.")
-        pe_grid = constants.kb * ne_grid * Te_grid
-    _assign_from_rect_grid(coeffs["pe"], pe_grid, geom.r, geom.z)
+    _assign_from_rect_grid(coeffs["grad_pe_r"], grad_pe_grid_r, geom.r, geom.z)
+    _assign_from_rect_grid(coeffs["grad_pe_z"], grad_pe_grid_z, geom.r, geom.z)
 
     QE, tiny = constants.q_e, 1e-300
     ne_grid_local = ne_grid
@@ -414,7 +412,7 @@ def update_phi_coeffs_from_grids(
     _assign_from_rect_grid(coeffs["sigma_H"],        sigma_H_grid,        geom.r, geom.z)
 
     # --- flow & B (zero if not provided) --- #
-    zero = np.zeros_like(pe_grid)
+    zero = np.zeros_like(ne_grid)
     _assign_from_rect_grid(coeffs["un_r"],     zero if un_r_grid     is None else un_r_grid,     geom.r, geom.z)
     _assign_from_rect_grid(coeffs["un_theta"], zero if un_theta_grid is None else un_theta_grid, geom.r, geom.z)
     _assign_from_rect_grid(coeffs["Bz"],       zero if Bz_grid       is None else Bz_grid,       geom.r, geom.z)
@@ -439,19 +437,18 @@ def solve_phi_axisym(geom,
     dx         = geom.fem.dx
     ds         = geom.fem.ds
 
-    V = coeffs["pe"].function_space
+    V = coeffs["ne"].function_space
     x = ufl.SpatialCoordinate(msh)
     r = x[0]
 
     # Unpack coeffs
-    pe = coeffs["pe"]; ne = coeffs["ne"]; inv_e_ne = coeffs["inv_e_ne"]
+    grad_pe_r = coeffs["grad_pe_r"]; grad_pe_z = coeffs["grad_pe_z"]; ne = coeffs["ne"]; inv_e_ne = coeffs["inv_e_ne"]
     sigma_parallel = coeffs["sigma_parallel"]; sigma_P = coeffs["sigma_P"]; sigma_H = coeffs["sigma_H"]
     un_r = coeffs["un_r"]; un_theta = coeffs["un_theta"]; Bz = coeffs["Bz"]
 
     # Sources/tensor
-    grad_pe = ufl.grad(pe)
-    S_r = - inv_e_ne*grad_pe[0] + Bz*un_theta
-    S_z = - inv_e_ne*grad_pe[1]
+    S_r = inv_e_ne*grad_pe_r + Bz*un_theta
+    S_z = inv_e_ne*grad_pe_z
     J_S = ufl.as_vector([sigma_P*S_r + sigma_H*Bz*un_r, sigma_parallel*S_z])
     K   = ufl.as_matrix([[sigma_P, 0.0], [0.0, sigma_parallel]])
 
