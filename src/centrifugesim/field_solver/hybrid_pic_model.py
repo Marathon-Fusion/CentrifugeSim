@@ -23,6 +23,7 @@ class HybridPICModel:
 
         # for cathode boundary condition
         self.dphi_dz_cathode_top_vec = np.zeros(self.Nr).astype(np.float64)
+        self.Jz_cathode_top_vec = np.zeros(self.Nr).astype(np.float64)
 
         # fields
         self.phi_grid = np.zeros((self.Nr, self.Nz)).astype(np.float64)
@@ -83,7 +84,7 @@ class HybridPICModel:
         # Should be input instead
         # add here check that sigma_r is smaller than rmax_injection/2, ideally /3
         rmax_injection = geom.rmax_cathode
-        sigma_r = rmax_injection/2.0
+        sigma_r = rmax_injection/3.0
 
         dphi_dz_vec = np.zeros(self.Nr).astype(np.float64)
 
@@ -91,15 +92,19 @@ class HybridPICModel:
         j_cathode = ((int(geom.zmax_cathode/geom.dz)+1)*np.ones_like(i_cathode)).astype(np.int32)
 
         # calculate input current density (Jz0 is negative)
-        Jz0 = I / (np.sqrt(2*np.pi)*np.pi*sigma_r)
-        Jz_cathode = Jz0*np.exp(-0.5*geom.r[i_cathode]**2 / sigma_r**2)/geom.dr
+        Jz0 = I / (2*np.pi*sigma_r**2)
+        Jz_cathode = Jz0*np.exp(-0.5*geom.r[i_cathode]**2 / sigma_r**2)
+
+        sigma_parallel_cathode = electron_fluid.sigma_parallel_grid[i_cathode, j_cathode]
 
         # dphi_dz = (Jiz-Jz)/sigma_parallel + dpe/dz /(e*ne) at cathode
         # but using only Jz for now to test
-        sigma_parallel_cathode = electron_fluid.sigma_parallel_grid[i_cathode, j_cathode]
-        dphi_dz_vec[i_cathode] = -Jz_cathode/sigma_parallel_cathode
+        dphi_dz_vec_aux = -Jz_cathode/sigma_parallel_cathode # change to dphi_dz = (Jiz-Jz)/sigma_parallel + dpe/dz /(e*ne) at cathode
+
+        dphi_dz_vec[i_cathode] = - dphi_dz_vec_aux # flipping sign here due to how the solver was written
 
         self.dphi_dz_cathode_top_vec = np.copy(dphi_dz_vec)
+        self.Jz_cathode_top_vec[i_cathode] = np.copy(Jz_cathode)
 
     #-----------------------------------------------------------------------------
     #------------------------------ Calls to FV solver ---------------------------
