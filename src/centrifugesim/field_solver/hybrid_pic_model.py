@@ -157,6 +157,154 @@ class HybridPICModel:
 
         del phi, Er, Ez, Jer, Jez, q_ohm
 
+    # -------- Calculate electrodes currents
+    def compute_electrode_currents(self, geom, return_parts=False):
+        """
+        Compute cathode and anode currents (positive = into the electrode) for an axisymmetric RZ grid.
+
+        Parameters
+        ----------
+        geom : Geometry
+            Geometry object (as in your code). Assumes:
+            - zmin == 0.0 (domain starts at 0)
+            - anode 'upper' radial boundary is at rmax
+            - geom.zmax_anode2 already set (zmin_anode2 + (zmax_anode - zmin_anode))
+        Jer, Jez : np.ndarray, shape (Nr, Nz)
+            Radial and axial current density components [A/m^2].
+            Arrays are defined on the same (r,z) nodes as geom.r, geom.z.
+        return_parts : bool, default False
+            If True, also return a dict with individual face contributions for debugging.
+
+        Returns
+        -------
+        I_anode : float
+            Total current into the anode [A].
+        I_cathode : float
+            Total current into the cathode [A].
+        parts : dict (optional)
+            Individual contributions; only returned if return_parts=True.
+        """
+        # --- helpers ---------------------------------------------------------------
+        Jer = self.Jer_grid
+        Jez = self.Jez_grid
+
+        twopi = 2.0 * np.pi
+        Nr, Nz = geom.Nr, geom.Nz
+
+        def ir_at(rval):
+            i = int(round((rval - geom.rmin) / geom.dr))
+            return max(0, min(Nr-1, i))
+
+        def iz_at(zval):
+            i = int(round((zval - geom.zmin) / geom.dz))
+            return max(0, min(Nz-1, i))
+
+        def trapz_r(f_r, r_slice):
+            return np.trapz(f_r, geom.r[r_slice])
+
+        def trapz_z(f_z, z_slice):
+            return np.trapz(f_z, geom.z[z_slice])
+
+        # indices (use rounding; all your geometry values are multiples of dr/dz)
+        assert abs(geom.zmin) < 1e-12, "This function assumes zmin == 0."
+
+        ir0 = 0
+        ir_rmax = Nr - 1
+        ir_rcath = ir_at(geom.rmax_cathode)
+        iz_zcath = iz_at(geom.zmax_cathode)
+
+        ir_rminA = ir_at(geom.rmin_anode)
+        iz_zminA1 = iz_at(geom.zmin_anode)
+        iz_zmaxA1 = iz_at(geom.zmax_anode)
+
+        iz_zminA2 = iz_at(geom.zmin_anode2)
+        # Make sure zmax_anode2 is available (your Geometry sets it)
+        if not hasattr(geom, 'zmax_anode2'):
+            geom.zmax_anode2 = geom.zmin_anode2 + (geom.zmax_anode - geom.zmin_anode)
+        iz_zmaxA2 = iz_at(geom.zmax_anode2)
+
+        iz_zmax = Nz - 1
+
+        parts = {}
+
+        # ------------------- Cathode faces -------------------
+        # Top face of the cathode rectangle: z = zmax_cathode, r in [0, rmax_cathode]
+        # Sample at the plasma side (above): iz = iz_zcath + 1 (clamped)
+        iz_top_plasma = min(iz_zcath + 1, Nz - 1)
+        r_slice_cath = slice(0, ir_rcath + 1)
+        I_cathode_z = trapz_r(twopi * geom.r[r_slice_cath] * Jez[r_slice_cath, iz_top_plasma], r_slice_cath)
+
+        # Side face of the cathode rectangle: r = rmax_cathode, z in [0, zmax_cathode]
+        # Plasma is at larger r, so sample at ir = ir_rcath + 1 (clamped)
+        ir_side_plasma = min(ir_rcath + 1, Nr - 1)
+        z_slice_cath = slice(0, iz_zcath + 1)
+        I_cathode_r = trapz_z(twopi * geom.rmax_cathode * Jer[ir_side_plasma, z_slice_cath], z_slice_cath)
+
+        I_cathode = I_cathode_z + I_cathode_r
+        parts['I_cathode_z'] = I_cathode_z
+        parts['I_cathode_r'] = I_cathode_r
+
+        # ------------------- Anode ring 1 -------------------
+        # Vertical inner face at r = rmin_anode, z in [zmin_anode, zmax_anode]:
+        # Plasma is at smaller r, so take ir = ir_rminA (no +1)
+        z_slice_A1 = slice(iz_zminA1, iz_zmaxA1 + 1)
+        I_a1_r = trapz_z(twopi * geom.rmin_anode * Jer[ir_rminA, z_slice_A1], z_slice_A1)
+
+        # Bottom face at z = zmin_anode, r in [rmin_anode, rmax]; plasma below -> sample at iz = iz_zminA1
+        r_slice_A1 = slice(ir_rminA, ir_rmax + 1)
+        I_a1_zbot = trapz_r(twopi * geom.r[r_slice_A1] * Jez[r_slice_A1, iz_zminA1], r_slice_A1)
+
+        # Top face at z = zmax_anode, r in [rmin_anode, rmax]; plasma above -> sample at iz = iz_zmaxA1 + 1; sign negative
+        iz_A1_top_plasma = min(iz_zmaxA1 + 1, Nz - 1)
+        I_a1_ztop = -trapz_r(twopi * geom.r[r_slice_A1] * Jez[r_slice_A1, iz_A1_top_plasma], r_slice_A1)
+
+        parts['I_anode_1_r'] = I_a1_r
+        parts['I_anode_1_zbot'] = I_a1_zbot
+        parts['I_anode_1_ztop'] = I_a1_ztop
+
+        # ------------------- Anode ring 2 -------------------
+        # Vertical inner face at r = rmin_anode, z in [zmin_anode2, zmax_anode2]
+        z_slice_A2 = slice(iz_zminA2, iz_zmaxA2 + 1)
+        I_a2_r = trapz_z(twopi * geom.rmin_anode * Jer[ir_rminA, z_slice_A2], z_slice_A2)
+
+        # Bottom face at z = zmin_anode2, r in [rmin_anode, rmax]; plasma below
+        I_a2_zbot = trapz_r(twopi * geom.r[r_slice_A1] * Jez[r_slice_A1, iz_zminA2], r_slice_A1)
+
+        # Top face at z = zmax_anode2, r in [rmin_anode, rmax]; plasma above -> sample at iz = iz_zmaxA2 + 1; negative sign
+        iz_A2_top_plasma = min(iz_zmaxA2 + 1, Nz - 1)
+        I_a2_ztop = -trapz_r(twopi * geom.r[r_slice_A1] * Jez[r_slice_A1, iz_A2_top_plasma], r_slice_A1)
+
+        parts['I_anode_2_r'] = I_a2_r
+        parts['I_anode_2_zbot'] = I_a2_zbot
+        parts['I_anode_2_ztop'] = I_a2_ztop
+
+        # ------------------- Outer wall segments at r = rmax -------------------
+        # Segment between rings: z in (zmax_anode, zmin_anode2)
+        z_start = min(iz_zmaxA1 + 1, Nz - 1)
+        z_stop  = max(iz_zminA2, z_start)  # exclusive in python slice semantics
+        I_awall_1 = 0.0
+        if z_stop > z_start:
+            z_slice_w1 = slice(z_start, z_stop)
+            I_awall_1 = trapz_z(twopi * geom.rmax * Jer[ir_rmax, z_slice_w1], z_slice_w1)
+
+        # Segment after ring 2: z in (zmax_anode2, zmax]
+        z_start2 = min(iz_zmaxA2 + 1, Nz - 1)
+        z_slice_w2 = slice(z_start2, Nz)
+        I_awall_2 = 0.0
+        if z_start2 < Nz:
+            I_awall_2 = trapz_z(twopi * geom.rmax * Jer[ir_rmax, z_slice_w2], z_slice_w2)
+
+        parts['I_anode_wall_between'] = I_awall_1
+        parts['I_anode_wall_top'] = I_awall_2
+
+        I_anode = (I_a1_r + I_a1_zbot + I_a1_ztop +
+                I_a2_r + I_a2_zbot + I_a2_ztop +
+                I_awall_1 + I_awall_2)
+
+        if return_parts:
+            return I_anode, I_cathode, parts
+        return I_anode, I_cathode
+
     #-----------------------------------------------------------------------------
     #----------------------------- Calls to FEM solver ---------------------------
     #-----------------------------------------------------------------------------
