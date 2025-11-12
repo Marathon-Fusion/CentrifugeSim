@@ -176,7 +176,7 @@ class ParticleContainer:
         # check if particles are absorbed at second anode:
         dz_anode = geom.zmax_anode - geom.zmin_anode
         ind_anode_2 = cp.flatnonzero(cp.logical_and(self.r>=geom.rmin_anode,
-                        cp.logical_and(self.z>=geom.zmin_anode2,self.z<=geom.zmin_anode2+dz_anode)))
+                        cp.logical_and(self.z>=geom.zmin_anode2,self.z<=geom.zmax_anode2)))
         if(ind_anode_2.shape[0]>0):
             self.remove_indices_and_free_memory(ind_anode_2)
 
