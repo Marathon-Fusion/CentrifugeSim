@@ -1,7 +1,7 @@
 import numpy as np
 
 from centrifugesim.fluids.neutral_fluid import NeutralFluidContainer
-from centrifugesim.fluids import electron_fluid_kernels_numba
+from centrifugesim.fluids import electron_fluid_helper
 from centrifugesim.geometry.geometry import Geometry
 from centrifugesim import constants
 
@@ -120,7 +120,7 @@ class ElectronFluidContainer:
           - self.nu_ei : electron-ion (Spitzer)
           - self.nu_e  : total = nu_en + nu_ei
         """
-        nu_en_grid, nu_ei_grid, nu_e_grid = electron_fluid_kernels_numba.electron_collision_frequencies(
+        nu_en_grid, nu_ei_grid, nu_e_grid = electron_fluid_helper.electron_collision_frequencies(
             self.Te_grid, self.ne_grid, nn_grid, lnLambda=lnLambda, sigma_en_m2=sigma_en_m2, Te_is_eV=Te_is_eV
         )
         self.nu_en_grid[:] = nu_en_grid
@@ -137,7 +137,7 @@ class ElectronFluidContainer:
 
         Bmag_grid = hybrid_pic.Bmag_grid
 
-        sigma_par_e, sigma_P_e, sigma_H_e, _beta_e = electron_fluid_kernels_numba.electron_conductivities(
+        sigma_par_e, sigma_P_e, sigma_H_e, _beta_e = electron_fluid_helper.electron_conductivities(
             self.Te_grid, self.ne_grid, Bmag_grid, self.nu_e_grid, lnLambda=lnLambda, sigma_en_m2=sigma_en_m2, Te_is_eV=Te_is_eV
         )
         self.sigma_parallel_grid[:] = sigma_par_e
@@ -171,7 +171,7 @@ class ElectronFluidContainer:
 
         # Helper to perform one advance with a given local dt
         def _advance(dt_local):
-            electron_fluid_kernels_numba.solve_step(
+            electron_fluid_helper.solve_step(
                 self.Te_grid, Te_new,
                 geom.dr, geom.dz, geom.r,
                 self.ne_grid, Q_Joule_grid,
