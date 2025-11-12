@@ -482,6 +482,24 @@ class ParticleContainer:
         del ui_r, ui_t, ui_z
         cp._default_memory_pool.free_all_blocks()
 
+    def compute_weight_decay_recombination(self, geom, dt, nu_recombination_grid):
+        """
+        Compute weight decay due to recombination.
+        The weight decay is given by the formula:
+        w_new = w_old * exp(-recombination_rate * ne * dt)
+        """
+        if self.N == 0:
+            return  # nothing to do
+
+        # Gather local electron density at particle positions
+        nu_recombination_loc = self.gatherScalarField(nu_recombination_grid, geom.dr, geom.dz, geom.zmin)  # [m^-3]
+        decay_factor = cp.exp(-nu_recombination_loc * dt).astype(cp.float32)
+        self.weight *= decay_factor
+
+        # Remove particles with zero or negative weight
+        ind_zero_weight = cp.flatnonzero(self.weight <= 0)
+        if ind_zero_weight.shape[0] > 0:
+            self.remove_indices_and_free_memory(ind_zero_weight)
 
     def collide_with_neutrals_mcc(
         self,
