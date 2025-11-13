@@ -333,10 +333,11 @@ def _interp1_scalar(xp, fp, x):
     return y0 + (y1 - y0) * (x - x0) / (x1 - x0)
 
 @njit(parallel=True, cache=True)
-def eval_rate_map_numba(Te_grid, rate_grid, Te2d):
+def eval_rate_map_numba(mask, Te_grid, rate_grid, Te2d):
     out = np.empty_like(Te2d)
     n0, n1 = Te2d.shape
     for i in prange(n0):
         for j in range(n1):
-            out[i, j] = _interp1_scalar(Te_grid, rate_grid, Te2d[i, j])
+            if(mask[i,j]==1):
+                out[i, j] = _interp1_scalar(Te_grid, rate_grid, Te2d[i, j])
     return out
