@@ -344,7 +344,8 @@ def _assemble_coefficients_core(
                         aS[i, j]  = 0.0
                     elif cathode_u8[i, j-1] == 1:
                         # Top of cathode: impose ∂φ/∂z = g_top_cathode[i]
-                        ks = sigPar_n[i, j-1] if Nz > 1 else 0.0
+                        #ks = sigPar_n[i, j-1] if Nz > 1 else 0.0
+                        ks = sigPar_n[i, j]
                         qzS = ks * g_top_cathode[i]
                         b[i, j] += r_c[i] * qzS / dz_j[j]
                         aS[i, j]  = 0.0
@@ -489,6 +490,7 @@ def compute_source_S(r, z,
                      ne_floor,
                      Bz=None, un_theta=None,
                      Ji_r=None, Ji_z=None,
+                     mask=None,
                      eps=1e-30):
     """
     Build S(r,z) for:
@@ -516,6 +518,17 @@ def compute_source_S(r, z,
 
     sigP_e, sigPar_n = build_face_conductivities(sigma_P, sigma_parallel)
 
+    if mask is not None:
+        mu = (mask.astype(np.uint8) != 0)
+        face_r = (mu[:-1, :] & mu[1:, :]).astype(float)     # (Nr-1, Nz)
+        face_z = (mu[:, :-1] & mu[:,  1:]).astype(float)    # (Nr, Nz-1)
+    else:
+        face_r = 1.0
+        face_z = 1.0
+
+    sigP_e   = sigP_e   * face_r
+    sigPar_n = sigPar_n * face_z
+
     # --- helpers for padding face quantities to cell centers ---
     def pad_east_faces(F_e):       # (Nr-1, Nz) -> (Nr, Nz), east-face flux for each cell
         G = np.zeros((Nr, Nz), dtype=F_e.dtype)
@@ -541,12 +554,12 @@ def compute_source_S(r, z,
     # radial faces (between i and i+1)
     ne_e = 0.5 * (ne[:-1, :] + ne[1:, :])
     inv_e_ne_e = 1.0 / (echarge * np.maximum(ne_e, ne_floor))
-    dpdr_e = (pe[1:, :] - pe[:-1, :]) / (dr_e[:-1][:, None])  # (Nr-1, Nz)
+    dpdr_e = (pe[1:, :] - pe[:-1, :]) / (dr_e[:-1][:, None]) * face_r  # (Nr-1, Nz)
 
     # axial faces (between j and j+1)
     ne_n = 0.5 * (ne[:, :-1] + ne[:, 1:])
     inv_e_ne_n = 1.0 / (echarge * np.maximum(ne_n, ne_floor))
-    dpdz_n = (pe[:, 1:] - pe[:, :-1]) / (dz_n[:-1][None, :])  # (Nr, Nz-1)
+    dpdz_n = (pe[:, 1:] - pe[:, :-1]) / (dz_n[:-1][None, :]) * face_z  # (Nr, Nz-1)
 
     # --- "pressure battery" + neutral-rotation (Bz uθ) fluxes ---
     # radial fluxes: F_r = -σP*(1/e ne)*∂r pe - σP*(Bz uθ)
@@ -558,6 +571,15 @@ def compute_source_S(r, z,
 
     # axial fluxes: F_z = -σ||*(1/e ne)*∂z pe
     Fz = -sigPar_n * inv_e_ne_n * dpdz_n
+
+    if mask is not None:
+        mu8 = (mask.astype(np.uint8) != 0)
+        # radial faces exist only if both adjacent cells are plasma
+        face_r = (mu8[:-1,:] & mu8[1:,:]).astype(Fr.dtype)     # (Nr-1,Nz)
+        # axial faces exist only if both adjacent cells are plasma
+        face_z = (mu8[:, :-1] & mu8[:,  1:]).astype(Fz.dtype)  # (Nr,Nz-1)
+        Fr *= face_r
+        Fz *= face_z
 
     # --- divergence of those fluxes (axisymmetric in r) ---
     # radial: (1/r) ∂_r( r Fr ) -> ( r_e*Fr_e - r_w*Fr_w ) / (r_c*dr_i)
@@ -573,14 +595,18 @@ def compute_source_S(r, z,
     # --- ion current divergence ---
     # face-average the supplied cell-centered currents
     if Ji_r is not None:
-        Jir_e = 0.5 * (Ji_r[1:, :] + Ji_r[:-1, :])  # (Nr-1, Nz)
+        Jir_e = 0.5 * (Ji_r[1:, :] + Ji_r[:-1, :]) * face_r # (Nr-1, Nz)
     else:
         Jir_e = np.zeros((Nr-1, Nz), dtype=sigma_P.dtype)
 
     if Ji_z is not None:
-        Jiz_n = 0.5 * (Ji_z[:, 1:] + Ji_z[:, :-1])  # (Nr, Nz-1)
+        Jiz_n = 0.5 * (Ji_z[:, 1:] + Ji_z[:, :-1]) * face_z   # (Nr, Nz-1)
     else:
         Jiz_n = np.zeros((Nr, Nz-1), dtype=sigma_P.dtype)
+
+    if mask is not None:
+        Jir_e *= face_r
+        Jiz_n *= face_z
 
     Jir_e_pad = pad_east_faces(Jir_e)
     Jir_w_pad = pad_west_faces(Jir_e)  # west = east of left cell
@@ -592,6 +618,9 @@ def compute_source_S(r, z,
 
     # total source
     S = S_r + S_z + S_Jr + S_Jz
+    if mask is not None:
+        S = np.where(mu8, S, 0.0)
+
     return S
 
 @njit(parallel=True, fastmath=True, cache=True)
@@ -683,9 +712,8 @@ def solve_anisotropic_poisson_FV(geom,
                          ne, pe,
                          ne_floor,
                          Bz=Bz, un_theta=un_theta,
-                         Ji_r=Ji_r, Ji_z=Ji_z)
-    # zero source in solids
-    S = np.where(geom.mask == 1, S, 0.0)
+                         Ji_r=Ji_r, Ji_z=Ji_z,
+                         mask=geom.mask)
 
     aP, aE, aW, aN, aS, b = assemble_coefficients(
         geom.r, geom.z,
