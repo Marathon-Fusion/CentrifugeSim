@@ -96,10 +96,11 @@ class HybridPICModel:
         Jz_cathode = Jz0*np.exp(-0.5*geom.r[i_cathode]**2 / sigma_r**2)
 
         sigma_parallel_cathode = electron_fluid.sigma_parallel_grid[i_cathode, j_cathode]
+        dpe_dz_cathode = (electron_fluid.pe_grid[i_cathode, j_cathode+1] - electron_fluid.pe_grid[i_cathode, j_cathode])/geom.dz
 
         # dphi_dz = (Jiz-Jz)/sigma_parallel + dpe/dz /(e*ne) at cathode
-        # but using only Jz for now to test
-        dphi_dz_vec_aux = -Jz_cathode/sigma_parallel_cathode # change to dphi_dz = (Jiz-Jz)/sigma_parallel + dpe/dz /(e*ne) at cathode
+        #dphi_dz_vec_aux = -Jz_cathode/sigma_parallel_cathode
+        dphi_dz_vec_aux = -Jz_cathode/sigma_parallel_cathode + dpe_dz_cathode/(constants.q_e*electron_fluid.ne_grid[i_cathode, j_cathode])
 
         dphi_dz_vec[i_cathode] = - dphi_dz_vec_aux # flipping sign here due to how the solver was written
 

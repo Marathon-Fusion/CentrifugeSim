@@ -440,6 +440,7 @@ class Chemistry:
         electron_fluid: ElectronFluidContainer,
         neutral_fluid: NeutralFluidContainer,
         particle_container: ParticleContainer,
+        Te_min_eV_ionization: float,
         nppc_new: int,
         dt: float,
         ) -> "np.ndarray":
@@ -526,6 +527,9 @@ class Chemistry:
         if ((k_ion_map*nn*dt).max()>0.2):
             print("WARNING: Large ionization fraction this step (>20%) may cause instability.")
 
+        Te_min_K_ionization = kelvin_from_eV(Te_min_eV_ionization)
+        k_ion_map = np.where(Te >= Te_min_K_ionization, k_ion_map, 0.0)
+
         # Extend here for multiple inelastic collisions and or ionization reactions in the future
         # ...
         # ...
@@ -547,10 +551,14 @@ class Chemistry:
         electron_fluid.Te_grid[:, :] = Te_new
 
         # Add new ions here using delta_ne
-        w_p, r_p, z_p, vr_p, vt_p, vz_p = initialize_ions_from_ni_nppc(delta_ne, neutral_fluid.T_n_grid,
-                                                                        geom.R, geom.Z, geom.dr, geom.dz,
-                                                                        nppc_new, particle_container.m)
-                                                                        
-        particle_container.add_from_numpy_arrays(geom, w_p, r_p, z_p, vr_p, vt_p, vz_p)
+        # commented, will do from accumulated delta_ne outside of electron loop
+        # w_p, r_p, z_p, vr_p, vt_p, vz_p = initialize_ions_from_ni_nppc(delta_ne, neutral_fluid.T_n_grid,
+        #                                                                geom.R, geom.Z, geom.dr, geom.dz,
+        #                                                                nppc_new, particle_container.m)                                                                        
+        # particle_container.add_from_numpy_arrays(geom, w_p, r_p, z_p, vr_p, vt_p, vz_p)
+
+        # Remove density from neutral gas
+        neutral_fluid.nn_grid[:, :] -= delta_ne
+        neutral_fluid.update_rho(); neutral_fluid.update_p()
 
         return delta_ne
