@@ -6,12 +6,24 @@ from typing import Callable, Dict, Iterable, Optional, Tuple, Union
 import logging
 import math
 import ast
+import re
 
-# Required by the user specification
+import numpy as np
+
+from centrifugesim import constants
+from centrifugesim.geometry.geometry import Geometry
+from centrifugesim.fluids.neutral_fluid import NeutralFluidContainer
+from centrifugesim.fluids.electron_fluid import ElectronFluidContainer
+from centrifugesim.particles.particle_container import ParticleContainer
+
+from centrifugesim.initialization.init_particles import initialize_ions_from_ni_nppc
+from centrifugesim.chemistry.chemistry_helper import update_Te_inelastic
+
 try:
     from centrifugesim.chemistry.maxwellian_rates import (
         build_rate_table_and_interpolator,
-        kelvin_from_eV
+        kelvin_from_eV,
+        eval_rate_map_numba
     )
 except Exception as e:  # pragma: no cover
     raise ImportError(
@@ -103,6 +115,7 @@ class ReactionRate:
     k_grid_m3s: "list[float] | tuple | 'np.ndarray'"
     k_interp: Callable[[float], float]
     meta: dict
+    delta_E_eV: float = 0.0          # optional energy change per reaction (eV)
 
     @property
     def type(self) -> str:
@@ -302,6 +315,8 @@ class Chemistry:
                 spacing=self._spacing,
             )
 
+            delta_E_eV = self._extract_delta_E_eV_from_file(path)
+
             if self.Te_grid_K is None:
                 self.Te_grid_K = Te_grid_K
                 try:
@@ -334,6 +349,7 @@ class Chemistry:
                 k_grid_m3s=k_grid_m3s,
                 k_interp=k_interp,
                 meta=meta_all,
+                delta_E_eV=delta_E_eV,
             )
 
         # 2) Analytic rate coefficients
@@ -394,3 +410,147 @@ class Chemistry:
             return True
         except Exception:
             return False
+
+    @staticmethod
+    def _extract_delta_E_eV_from_file(path: Path) -> float:
+        """
+        Return ionization threshold energy (eV) if present in a 'PARAM' line like:
+            'PARAM.:  E = 13.6 eV, complete set'
+        Otherwise return 0.0. Elastic/recombination entries typically lack 'E =' and will yield 0.0.
+        """
+        try:
+            with path.open("r", encoding="utf-8", errors="ignore") as f:
+                for raw in f:
+                    line = raw.strip()
+                    # Focus on the PARAM line only
+                    if line.upper().startswith("PARAM"):
+                        m = re.search(
+                            r"\bE\s*=\s*([+\-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+\-]?\d+)?)\s*eV\b",
+                            line,
+                        )
+                        if m:
+                            return float(m.group(1))
+        except Exception as e:
+            return 0.0
+
+
+    def do_ionization(
+        self,
+        geom: Geometry,
+        electron_fluid: ElectronFluidContainer,
+        neutral_fluid: NeutralFluidContainer,
+        particle_container: ParticleContainer,
+        nppc_new: int,
+        dt: float,
+        ) -> "np.ndarray":
+        """
+        Advance electron temperature by one explicit step including 
+        ionization energy losses.
+
+        d/dt ( 3/2 * k_b * n_e * T_e ) = - n_e * n_n * k_ion(T_e) * ΔE_ion
+
+        Where:
+        - k_ion(T_e) [m^3/s] is evaluated at Te (Kelvin) using the pre-built
+            ionization rate table/interpolator
+        - ΔE_ion is ionization energy (J) for the reaction (e.g., 13.6 eV for H)
+
+        Updates electron_fluid.Te_grid IN-PLACE on nodes where mask == 1.
+        Returns the field k_ion * n_e * n_n * dt (requested for later use).
+
+        Parameters
+        ----------
+        electron_fluid : ElectronFluidContainer
+            Provides ne_grid [m^-3], Te_grid [K], ne_floor (float).
+        neutral_fluid : NeutralFluidContainer
+            Provides nn_grid [m^-3].
+        particle_container : ParticleContainer
+            Container to add newly created ions into.
+        nppc_new : int
+            Number of particles per cell for newly created ions.
+        dt : float
+            Time step [s].
+
+        Returns
+        -------
+        ne_nn_k_dt : np.ndarray
+            2D array: k_ion * n_e * n_n * dt on mask==1 nodes (0 outside mask).
+        """
+        # --- fetch mask (Geometry) robustly ---
+        mask = geom.mask
+
+        # --- field references ---
+        ne = electron_fluid.ne_grid
+        Te = electron_fluid.Te_grid
+        nn = neutral_fluid.nn_grid
+
+        # Safety shape checks
+        if not (ne.shape == Te.shape == nn.shape == mask.shape):
+            raise ValueError(
+                "Shape mismatch among grids. "
+                f"ne{ne.shape}, Te{Te.shape}, nn{nn.shape}, mask{mask.shape}"
+            )
+
+        # --- pick the ionization reaction (for now, there should be exactly one) ---
+        rxn = None
+        for r in self.reactions.values():
+            rtype = str(getattr(r, "type", "")).upper()
+            if rtype == "IONIZATION" or "ioniz" in r.name.lower():
+                rxn = r
+                break
+        if rxn is None:
+            # fallback: if there's exactly one, use it
+            if len(self.reactions) == 1:
+                rxn = next(iter(self.reactions.values()))
+            else:
+                raise RuntimeError("No IONIZATION reaction found in Chemistry.reactions")
+
+        # --- ionization energy [J] ---
+        # Prefer attribute (added earlier), else fallback to meta or 0.0
+        delta_E_eV = getattr(rxn, "delta_E_eV", None)
+        if delta_E_eV is None:
+            # try meta key if present
+            delta_E_eV = float((rxn.meta or {}).get("delta_E_eV", 0.0))
+        # robust conversion via Kelvin helper already imported in this module:
+        delta_E_J = float(constants.kb * kelvin_from_eV(float(delta_E_eV)))
+
+        # --- evaluate k_ion(Te) on masked nodes using provided numba function ---
+        # Note: eval_rate_map_numba writes only where mask==1; others are undefined,
+        # but our update kernel never reads them where mask==0.
+        k_ion_map = eval_rate_map_numba(
+            mask.astype(np.int64),
+            np.asarray(self.Te_grid_K),
+            np.asarray(rxn.k_grid_m3s),
+            np.asarray(Te),
+        )
+
+        if ((k_ion_map*nn*dt).max()>0.2):
+            print("WARNING: Large ionization fraction this step (>20%) may cause instability.")
+
+        # Extend here for multiple inelastic collisions and or ionization reactions in the future
+        # ...
+        # ...
+        # ...
+
+        # --- Numba-parallel in-place update (masked) ---
+        Te_new, delta_ne = update_Te_inelastic(
+            mask.astype(np.int8),
+            Te,
+            ne,
+            nn,
+            k_ion_map,
+            delta_E_J,
+            float(dt),
+            float(electron_fluid.ne_floor),
+        )
+
+        # commit updated temperature
+        electron_fluid.Te_grid[:, :] = Te_new
+
+        # Add new ions here using delta_ne
+        w_p, r_p, z_p, vr_p, vt_p, vz_p = initialize_ions_from_ni_nppc(delta_ne, neutral_fluid.T_n_grid,
+                                                                        geom.R, geom.Z, geom.dr, geom.dz,
+                                                                        nppc_new, particle_container.m)
+                                                                        
+        particle_container.add_from_numpy_arrays(geom, w_p, r_p, z_p, vr_p, vt_p, vz_p)
+
+        return delta_ne
