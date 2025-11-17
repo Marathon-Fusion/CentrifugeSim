@@ -202,65 +202,72 @@ def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
             div_q = div_qr_term + div_qz_term
 
             # =========================
-            # Enthalpy advection fluxes (conservative, upwind, masked faces = 0)
+            # Enthalpy advection (conservative (J,T) form, upwind T only)
             # =========================
-
-            # Centered electron velocities
-            uer_c = -Jer[i, j] / (qe * max(n_e[i, j], tiny))
-            uez_c = -Jez[i, j] / (qe * max(n_e[i, j], tiny))
-
-            # --- Right face (i+1/2, j) ---
+            # Right face i+1/2 (no flux if neighbor masked)
             F_r_rh = 0.0
-            if mask[i+1, j] == 1:
-                uer_ip = -Jer[i+1, j] / (qe * max(n_e[i+1, j], tiny))
-                u_rh = 0.5 * (uer_c + uer_ip)
-                if u_rh > 0.0:
-                    nT_up = n_e[i, j] * Te[i, j]
+            if i < NR - 1 and mask[i+1, j] == 1:
+                Jr_face = 0.5 * (Jer[i, j] + Jer[i+1, j])
+                if Jr_face > 0.0:
+                    T_up = Te[i, j]
                 else:
-                    nT_up = n_e[i+1, j] * Te[i+1, j]
-                F_r_rh = 2.5 * kb * nT_up * u_rh
+                    T_up = Te[i+1, j]
+                F_r_rh = -(2.5 * kb / qe) * T_up * Jr_face
 
-            # --- Left face (i-1/2, j) ---
+            # Left face i-1/2
             F_r_lh = 0.0
             if i > 1 and mask[i-1, j] == 1:
-                uer_im = -Jer[i-1, j] / (qe * max(n_e[i-1, j], tiny))
-                u_lh = 0.5 * (uer_c + uer_im)
-                if u_lh > 0.0:
-                    nT_up = n_e[i-1, j] * Te[i-1, j]
+                Jr_face = 0.5 * (Jer[i, j] + Jer[i-1, j])
+                if Jr_face > 0.0:
+                    T_up = Te[i-1, j]
                 else:
-                    nT_up = n_e[i, j] * Te[i, j]
-                F_r_lh = 2.5 * kb * nT_up * u_lh
+                    T_up = Te[i, j]
+                F_r_lh = -(2.5 * kb / qe) * T_up * Jr_face
 
-            # --- Top face (i, j+1/2) ---
+            # Top face j+1/2
             F_z_th = 0.0
-            if mask[i, j+1] == 1:
-                uez_jp = -Jez[i, j+1] / (qe * max(n_e[i, j+1], tiny))
-                u_th = 0.5 * (uez_c + uez_jp)
-                if u_th > 0.0:
-                    nT_up = n_e[i, j] * Te[i, j]
+            if j < NZ - 1 and mask[i, j+1] == 1:
+                Jz_face = 0.5 * (Jez[i, j] + Jez[i, j+1])
+                if Jz_face > 0.0:
+                    T_up = Te[i, j]
                 else:
-                    nT_up = n_e[i, j+1] * Te[i, j+1]
-                F_z_th = 2.5 * kb * nT_up * u_th
+                    T_up = Te[i, j+1]
+                F_z_th = -(2.5 * kb / qe) * T_up * Jz_face
 
-            # --- Bottom face (i, j-1/2) ---
+            # Bottom face j-1/2
             F_z_bh = 0.0
             if j > 1 and mask[i, j-1] == 1:
-                uez_jm = -Jez[i, j-1] / (qe * max(n_e[i, j-1], tiny))
-                u_bh = 0.5 * (uez_c + uez_jm)
-                if u_bh > 0.0:
-                    nT_up = n_e[i, j-1] * Te[i, j-1]
+                Jz_face = 0.5 * (Jez[i, j] + Jez[i, j-1])
+                if Jz_face > 0.0:
+                    T_up = Te[i, j-1]
                 else:
-                    nT_up = n_e[i, j] * Te[i, j]
-                F_z_bh = 2.5 * kb * nT_up * u_bh
+                    T_up = Te[i, j]
+                F_z_bh = -(2.5 * kb / qe) * T_up * Jz_face
 
             # Divergence of advective enthalpy flux in RZ
-            div_Fadv_r = (r_rh_face * F_r_rh - r_lh_face * F_r_lh) / (r_center * dr)
-            div_Fadv_z = (F_z_th - F_z_bh) / dz
-            div_Fadv = div_Fadv_r + div_Fadv_z
+            div_Fadv = (r_rh_face * F_r_rh - r_lh_face * F_r_lh) / (r_center * dr) + (F_z_th - F_z_bh) / dz
+
+            # -----------------------------------
+            # TO DO:
+            #      Change this to BC that accounts for Jez and kappa_parallel at cathode exit plane
+            # Corrections for masked faces (no-flux enforced, so add back missing fluxes)
+            
+            S_mask = 0.0
+            # radial corrections (RZ weighting)
+            if mask[i+1, j] == 0:  # right face missing
+                S_mask += (2.5 * kb / qe) * Te[i, j] * ( (r_rh_face / (r_center * dr)) * Jer[i, j] )
+            if mask[i-1, j] == 0 and i > 1:  # left face missing
+                S_mask -= (2.5 * kb / qe) * Te[i, j] * ( (r_lh_face / (r_center * dr)) * Jer[i, j] )
+
+            # axial corrections
+            if mask[i, j+1] == 0:  # top face missing
+                S_mask += (2.5 * kb / qe) * Te[i, j] * ( Jez[i, j] / dz )
+            if mask[i, j-1] == 0 and j > 1:  # bottom face missing
+                S_mask -= (2.5 * kb / qe) * Te[i, j] * ( Jez[i, j] / dz )
 
             # =========================
-            # Time update (explicit)
+            # Update
             # =========================
-            rhs = -div_q - div_Fadv + Q_Joule[i, j]
+            rhs = -div_q - div_Fadv + Q_Joule[i, j] + S_mask 
             dTe_dt = (2.0 / (3.0 * n_e[i, j] * kb)) * rhs
             Te_new[i, j] = Te[i, j] + dt * dTe_dt
