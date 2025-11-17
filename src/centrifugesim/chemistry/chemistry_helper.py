@@ -6,8 +6,7 @@ from centrifugesim import constants
 @njit(parallel=True, cache=True)
 def update_Te_inelastic(mask, Te, ne, nn, k_ion, delta_E_J, dt, ne_floor):
     """
-    Parallel masked update for electron temperature from Ohmic heating and
-    ionization energy loss.
+    Parallel masked update for electron temperature from ionization energy loss.
 
     Parameters
     ----------
