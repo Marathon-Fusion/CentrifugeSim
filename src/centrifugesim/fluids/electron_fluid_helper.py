@@ -91,82 +91,176 @@ def electron_conductivities(
 @numba.jit(nopython=True, parallel=True, nogil=True)
 def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
                br, bz, kappa_parallel, kappa_perp,
+               Jer, Jez,
                mask, dt):
     """
-    Advances the electron temperature Te by one time step DT.
-    Uses an explicit, cell-centered finite difference scheme.
-    The energy equation is only solved where mask == 1.
+    Advances electron temperature one explicit step with anisotropic conduction,
+    but with *no* heat flux across faces that touch masked cells (mask==0)
+    or the outer domain boundary. This prevents sinks at electrodes/boundaries.
+
+    All arrays are shape (NR, NZ). mask is int8 with 1=solve region, 0=masked.
     Explicit Euler for now just for testing, do not use for production runs.
     TO DO:
-    Change to Douglas-ADI to get unconditionally stable behavior and larger timestep size.
+        USE ne_floor instead of "tiny"
+        Change to Douglas-ADI to get unconditionally stable behavior and larger timestep size.
     """
     NR, NZ = Te.shape
+    kb = constants.kb
+    qe = constants.q_e
+    tiny = 1e9  # avoid division by zero
 
-    # Loop over the interior of the grid (parallelized by Numba)
     for i in numba.prange(1, NR - 1):
-        for j in numba.prange(1, NZ - 1):
-            
-            # Only solve the equation inside the plasma region (mask == 1)
-            if(mask[i, j] == 1 and n_e[i, j]>0):
-                # --- STABLE DIVERGENCE CALCULATION (CELL-CENTERED FLUX) ---
-                # This correctly calculates flux from plasma cells into the fixed-T cathode cells
-                # 1. Calculate flux q_r at the right-hand face (i + 1/2, j)
-                br_rh = (br[i, j] + br[i+1, j]) / 2.0
-                bz_rh = (bz[i, j] + bz[i+1, j]) / 2.0
-                k_par_rh = (kappa_parallel[i, j] + kappa_parallel[i+1, j]) / 2.0
-                k_perp_rh = (kappa_perp[i, j] + kappa_perp[i+1, j]) / 2.0
-                k_a_rh = k_par_rh - k_perp_rh
-                k_rr_rh = k_perp_rh + k_a_rh * br_rh**2
-                k_rz_rh = k_a_rh * br_rh * bz_rh
-                dT_dr_rh = (Te[i+1, j] - Te[i, j]) / dr
-                dT_dz_rh = (Te[i, j+1] - Te[i, j-1] + Te[i+1, j+1] - Te[i+1, j-1]) / (4 * dz)
-                qr_rh = -(k_rr_rh * dT_dr_rh + k_rz_rh * dT_dz_rh)
+        for j in range(1, NZ - 1):
 
-                # 2. Calculate flux q_r at the left-hand face (i - 1/2, j)
-                br_lh = (br[i, j] + br[i-1, j]) / 2.0
-                bz_lh = (bz[i, j] + bz[i-1, j]) / 2.0
-                k_par_lh = (kappa_parallel[i, j] + kappa_parallel[i-1, j]) / 2.0
-                k_perp_lh = (kappa_perp[i, j] + kappa_perp[i-1, j]) / 2.0
-                k_a_lh = k_par_lh - k_perp_lh
-                k_rr_lh = k_perp_lh + k_a_lh * br_lh**2
-                k_rz_lh = k_a_lh * br_lh * bz_lh
-                dT_dr_lh = (Te[i, j] - Te[i-1, j]) / dr
-                dT_dz_lh = (Te[i, j+1] - Te[i, j-1] + Te[i-1, j+1] - Te[i-1, j-1]) / (4 * dz)
-                qr_lh = -(k_rr_lh * dT_dr_lh + k_rz_lh * dT_dz_lh)
+            if not (mask[i, j] == 1 and n_e[i, j] > 0.0):
+                # Leave Te_new untouched for masked/vacuum cells
+                continue
 
-                # 3. Calculate flux q_z at the top face (i, j + 1/2)
-                br_th = (br[i, j] + br[i, j+1]) / 2.0
-                bz_th = (bz[i, j] + bz[i, j+1]) / 2.0
-                k_par_th = (kappa_parallel[i, j] + kappa_parallel[i, j+1]) / 2.0
-                k_perp_th = (kappa_perp[i, j] + kappa_perp[i, j+1]) / 2.0
-                k_a_th = k_par_th - k_perp_th
-                k_zz_th = k_perp_th + k_a_th * bz_th**2
-                k_rz_th = k_a_th * br_th * bz_th
-                dT_dz_th = (Te[i, j+1] - Te[i, j]) / dz
-                dT_dr_th = (Te[i+1, j] - Te[i-1, j] + Te[i+1, j+1] - Te[i-1, j+1]) / (4 * dr)
-                qz_th = -(k_rz_th * dT_dr_th + k_zz_th * dT_dz_th)
+            # --- Right face (i+1/2, j) ---
+            qr_rh = 0.0
+            if i < NR - 1 and mask[i+1, j] == 1:
+                # Ensure the cross-term stencil does not sample masked cells
+                if (mask[i, j+1] == 1 and mask[i, j-1] == 1 and
+                    mask[i+1, j+1] == 1 and mask[i+1, j-1] == 1):
 
-                # 4. Calculate flux q_z at the bottom face (i, j - 1/2)
-                br_bh = (br[i, j] + br[i, j-1]) / 2.0
-                bz_bh = (bz[i, j] + bz[i, j-1]) / 2.0
-                k_par_bh = (kappa_parallel[i, j] + kappa_parallel[i, j-1]) / 2.0
-                k_perp_bh = (kappa_perp[i, j] + kappa_perp[i, j-1]) / 2.0
-                k_a_bh = k_par_bh - k_perp_bh
-                k_zz_bh = k_perp_bh + k_a_bh * bz_bh**2
-                k_rz_bh = k_a_bh * br_bh * bz_bh
-                dT_dz_bh = (Te[i, j] - Te[i, j-1]) / dz
-                dT_dr_bh = (Te[i+1, j] - Te[i-1, j] + Te[i+1, j-1] - Te[i-1, j-1]) / (4 * dr)
-                qz_bh = -(k_rz_bh * dT_dr_bh + k_zz_bh * dT_dz_bh)
+                    br_rh = 0.5 * (br[i, j] + br[i+1, j])
+                    bz_rh = 0.5 * (bz[i, j] + bz[i+1, j])
+                    k_par_rh = 0.5 * (kappa_parallel[i, j] + kappa_parallel[i+1, j])
+                    k_perp_rh = 0.5 * (kappa_perp[i, j] + kappa_perp[i+1, j])
+                    k_a_rh = k_par_rh - k_perp_rh
+                    k_rr_rh = k_perp_rh + k_a_rh * br_rh * br_rh
+                    k_rz_rh = k_a_rh * br_rh * bz_rh
+                    dT_dr_rh = (Te[i+1, j] - Te[i, j]) / dr
+                    dT_dz_rh = (Te[i, j+1] - Te[i, j-1] + Te[i+1, j+1] - Te[i+1, j-1]) / (4.0 * dz)
+                    qr_rh = -(k_rr_rh * dT_dr_rh + k_rz_rh * dT_dz_rh)
+                # else: face touches masked cells via cross-stencil → enforce qr_rh = 0
 
-                # 5. Calculate divergence using the face fluxes
-                r_rh_face = r_vec[i] + dr / 2.0
-                r_lh_face = r_vec[i] - dr / 2.0
-                div_qr_term = (r_rh_face * qr_rh - r_lh_face * qr_lh) / ((r_vec[i] + 1e-12) * dr)
-                div_qz_term = (qz_th - qz_bh) / dz
-                div_q = div_qr_term + div_qz_term
-                
-                # --- Time Update (Forward Euler) ---
-                rhs = -div_q + Q_Joule[i, j]
-                dTe_dt = (2.0 / (3.0 * n_e[i, j] * constants.kb)) * rhs
-                
-                Te_new[i, j] = Te[i, j] + dt * dTe_dt
+            # --- Left face (i-1/2, j) ---
+            qr_lh = 0.0
+            # Symmetry at axis: enforce zero-flux at the inner boundary
+            if i > 1 and mask[i-1, j] == 1:
+                if (mask[i, j+1] == 1 and mask[i, j-1] == 1 and
+                    mask[i-1, j+1] == 1 and mask[i-1, j-1] == 1):
+
+                    br_lh = 0.5 * (br[i, j] + br[i-1, j])
+                    bz_lh = 0.5 * (bz[i, j] + bz[i-1, j])
+                    k_par_lh = 0.5 * (kappa_parallel[i, j] + kappa_parallel[i-1, j])
+                    k_perp_lh = 0.5 * (kappa_perp[i, j] + kappa_perp[i-1, j])
+                    k_a_lh = k_par_lh - k_perp_lh
+                    k_rr_lh = k_perp_lh + k_a_lh * br_lh * br_lh
+                    k_rz_lh = k_a_lh * br_lh * bz_lh
+                    dT_dr_lh = (Te[i, j] - Te[i-1, j]) / dr
+                    dT_dz_lh = (Te[i, j+1] - Te[i, j-1] + Te[i-1, j+1] - Te[i-1, j-1]) / (4.0 * dz)
+                    qr_lh = -(k_rr_lh * dT_dr_lh + k_rz_lh * dT_dz_lh)
+                # else: face touches masked cells via cross-stencil → enforce qr_lh = 0
+            # If i == 1, we are at the first active ring next to the axis: keep qr_lh = 0
+
+            # --- Top face (i, j+1/2) ---
+            qz_th = 0.0
+            if j < NZ - 1 and mask[i, j+1] == 1:
+                if (mask[i+1, j] == 1 and mask[i-1, j] == 1 and
+                    mask[i+1, j+1] == 1 and mask[i-1, j+1] == 1):
+
+                    br_th = 0.5 * (br[i, j] + br[i, j+1])
+                    bz_th = 0.5 * (bz[i, j] + bz[i, j+1])
+                    k_par_th = 0.5 * (kappa_parallel[i, j] + kappa_parallel[i, j+1])
+                    k_perp_th = 0.5 * (kappa_perp[i, j] + kappa_perp[i, j+1])
+                    k_a_th = k_par_th - k_perp_th
+                    k_zz_th = k_perp_th + k_a_th * bz_th * bz_th
+                    k_rz_th = k_a_th * br_th * bz_th
+                    dT_dz_th = (Te[i, j+1] - Te[i, j]) / dz
+                    dT_dr_th = (Te[i+1, j] - Te[i-1, j] + Te[i+1, j+1] - Te[i-1, j+1]) / (4.0 * dr)
+                    qz_th = -(k_rz_th * dT_dr_th + k_zz_th * dT_dz_th)
+                # else: face touches masked cells via cross-stencil → enforce qz_th = 0
+
+            # --- Bottom face (i, j-1/2) ---
+            qz_bh = 0.0
+            if j > 1 and mask[i, j-1] == 1:
+                if (mask[i+1, j] == 1 and mask[i-1, j] == 1 and
+                    mask[i+1, j-1] == 1 and mask[i-1, j-1] == 1):
+
+                    br_bh = 0.5 * (br[i, j] + br[i, j-1])
+                    bz_bh = 0.5 * (bz[i, j] + bz[i, j-1])
+                    k_par_bh = 0.5 * (kappa_parallel[i, j] + kappa_parallel[i, j-1])
+                    k_perp_bh = 0.5 * (kappa_perp[i, j] + kappa_perp[i, j-1])
+                    k_a_bh = k_par_bh - k_perp_bh
+                    k_zz_bh = k_perp_bh + k_a_bh * bz_bh * bz_bh
+                    k_rz_bh = k_a_bh * br_bh * bz_bh
+                    dT_dz_bh = (Te[i, j] - Te[i, j-1]) / dz
+                    dT_dr_bh = (Te[i+1, j] - Te[i-1, j] + Te[i+1, j-1] - Te[i-1, j-1]) / (4.0 * dr)
+                    qz_bh = -(k_rz_bh * dT_dr_bh + k_zz_bh * dT_dz_bh)
+                # else: face touches masked cells via cross-stencil → enforce qz_bh = 0
+            # If j == 1, we’re at the first active row next to z-min: keep qz_bh = 0
+
+            # --- Divergence (finite-volume consistent in RZ) ---
+            r_center = r_vec[i] + 1e-12
+            r_rh_face = r_vec[i] + 0.5 * dr
+            r_lh_face = r_vec[i] - 0.5 * dr
+
+            div_qr_term = (r_rh_face * qr_rh - r_lh_face * qr_lh) / (r_center * dr)
+            div_qz_term = (qz_th - qz_bh) / dz
+            div_q = div_qr_term + div_qz_term
+
+            # =========================
+            # Enthalpy advection fluxes (conservative, upwind, masked faces = 0)
+            # =========================
+
+            # Centered electron velocities
+            uer_c = -Jer[i, j] / (qe * max(n_e[i, j], tiny))
+            uez_c = -Jez[i, j] / (qe * max(n_e[i, j], tiny))
+
+            # --- Right face (i+1/2, j) ---
+            F_r_rh = 0.0
+            if mask[i+1, j] == 1:
+                uer_ip = -Jer[i+1, j] / (qe * max(n_e[i+1, j], tiny))
+                u_rh = 0.5 * (uer_c + uer_ip)
+                if u_rh > 0.0:
+                    nT_up = n_e[i, j] * Te[i, j]
+                else:
+                    nT_up = n_e[i+1, j] * Te[i+1, j]
+                F_r_rh = 2.5 * kb * nT_up * u_rh
+
+            # --- Left face (i-1/2, j) ---
+            F_r_lh = 0.0
+            if i > 1 and mask[i-1, j] == 1:
+                uer_im = -Jer[i-1, j] / (qe * max(n_e[i-1, j], tiny))
+                u_lh = 0.5 * (uer_c + uer_im)
+                if u_lh > 0.0:
+                    nT_up = n_e[i-1, j] * Te[i-1, j]
+                else:
+                    nT_up = n_e[i, j] * Te[i, j]
+                F_r_lh = 2.5 * kb * nT_up * u_lh
+
+            # --- Top face (i, j+1/2) ---
+            F_z_th = 0.0
+            if mask[i, j+1] == 1:
+                uez_jp = -Jez[i, j+1] / (qe * max(n_e[i, j+1], tiny))
+                u_th = 0.5 * (uez_c + uez_jp)
+                if u_th > 0.0:
+                    nT_up = n_e[i, j] * Te[i, j]
+                else:
+                    nT_up = n_e[i, j+1] * Te[i, j+1]
+                F_z_th = 2.5 * kb * nT_up * u_th
+
+            # --- Bottom face (i, j-1/2) ---
+            F_z_bh = 0.0
+            if j > 1 and mask[i, j-1] == 1:
+                uez_jm = -Jez[i, j-1] / (qe * max(n_e[i, j-1], tiny))
+                u_bh = 0.5 * (uez_c + uez_jm)
+                if u_bh > 0.0:
+                    nT_up = n_e[i, j-1] * Te[i, j-1]
+                else:
+                    nT_up = n_e[i, j] * Te[i, j]
+                F_z_bh = 2.5 * kb * nT_up * u_bh
+
+            # Divergence of advective enthalpy flux in RZ
+            div_Fadv_r = (r_rh_face * F_r_rh - r_lh_face * F_r_lh) / (r_center * dr)
+            div_Fadv_z = (F_z_th - F_z_bh) / dz
+            div_Fadv = div_Fadv_r + div_Fadv_z
+
+            # =========================
+            # Time update (explicit)
+            # =========================
+            rhs = -div_q - div_Fadv + Q_Joule[i, j]
+            dTe_dt = (2.0 / (3.0 * n_e[i, j] * kb)) * rhs
+            Te_new[i, j] = Te[i, j] + dt * dTe_dt
