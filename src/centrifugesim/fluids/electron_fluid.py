@@ -156,6 +156,7 @@ class ElectronFluidContainer:
                 self.ne_grid, Q_Joule_grid,
                 hybrid_pic.br_grid, hybrid_pic.bz_grid,
                 self.kappa_parallel_grid, self.kappa_perp_grid,
+                hybrid_pic.Jer_grid, hybrid_pic.Jez_grid,
                 geom.mask, dt_local
             )
             self.Te_grid[:, :] = Te_new
