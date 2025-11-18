@@ -214,93 +214,73 @@ def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
             # Advection (electron enthalpy)
             # =========================
 
-            # helper: face-average current; for masked neighbor use single-sided value from interior cell
-            # and determine upstream T along electron velocity (-J)
             # Right face i+1/2
             F_r_rh = 0.0
-            Jr_face = 0.0
             if i < NR - 1:
                 if mask[i+1, j] == 1:
                     Jr_face = 0.5 * (Jer[i, j] + Jer[i+1, j])
-                    # upwind along electron velocity => opposite to J
+                    # Electrons move opposite to J
                     if Jr_face > 0.0:
-                        T_up = Te[i+1, j]   # electrons move from right to left
+                        # electrons from right -> left
+                        T_up = Te[i+1, j]
                     else:
-                        T_up = Te[i, j]     # electrons move from left to right
-                    F_r_rh = -alpha * T_up * Jr_face
-                else:
-                    # masked neighbor: use one-sided J and boundary inflow temperature when needed
-                    Jr_face = Jer[i, j]
-                    if Jr_face > 0.0:
-                        # electrons come from masked neighbor (upwind is masked)
-                        T_up = T_in_mask
-                    else:
-                        # electrons come from interior cell
+                        # electrons from left -> right
                         T_up = Te[i, j]
-                    F_r_rh = -alpha * T_up * Jr_face
+                else:
+                    # boundary/masked neighbor: one-sided flux with zero-gradient T
+                    Jr_face = Jer[i, j]
+                    T_up = Te[i, j]
+                F_r_rh = -alpha * T_up * Jr_face
 
             # Left face i-1/2
             F_r_lh = 0.0
-            Jr_face = 0.0
             if i > 1:
                 if mask[i-1, j] == 1:
                     Jr_face = 0.5 * (Jer[i, j] + Jer[i-1, j])
                     if Jr_face > 0.0:
-                        T_up = Te[i, j]     # electrons move from i to i-1
-                    else:
-                        T_up = Te[i-1, j]   # electrons move from i-1 to i
-                    F_r_lh = -alpha * T_up * Jr_face
-                else:
-                    Jr_face = Jer[i, j]
-                    if Jr_face > 0.0:
-                        # electrons come from interior (i) to masked
+                        # electrons from right (i) -> left (i-1)
                         T_up = Te[i, j]
                     else:
-                        # electrons come from masked neighbor into cell
-                        T_up = T_in_mask
-                    F_r_lh = -alpha * T_up * Jr_face
+                        # electrons from left (i-1) -> right (i)
+                        T_up = Te[i-1, j]
+                else:
+                    Jr_face = Jer[i, j]
+                    T_up = Te[i, j]
+                F_r_lh = -alpha * T_up * Jr_face
+            # axis i==1: keep F_r_lh = 0
 
             # Top face j+1/2
             F_z_th = 0.0
-            Jz_face = 0.0
             if j < NZ - 1:
                 if mask[i, j+1] == 1:
                     Jz_face = 0.5 * (Jez[i, j] + Jez[i, j+1])
                     if Jz_face > 0.0:
-                        T_up = Te[i, j+1]   # electrons move from top to bottom
+                        # electrons from top (j+1) -> bottom (j)
+                        T_up = Te[i, j+1]
                     else:
-                        T_up = Te[i, j]     # electrons move from bottom to top
-                    F_z_th = -alpha * T_up * Jz_face
+                        # electrons from bottom (j) -> top (j+1)
+                        T_up = Te[i, j]
                 else:
                     Jz_face = Jez[i, j]
-                    if Jz_face > 0.0:
-                        # electrons come from masked (above) into cell
-                        T_up = T_in_mask
-                    else:
-                        # electrons go from cell up to masked region
-                        T_up = Te[i, j]
-                    F_z_th = -alpha * T_up * Jz_face
+                    T_up = Te[i, j]
+                F_z_th = -alpha * T_up * Jz_face
 
             # Bottom face j-1/2
             F_z_bh = 0.0
-            Jz_face = 0.0
             if j > 1:
                 if mask[i, j-1] == 1:
                     Jz_face = 0.5 * (Jez[i, j] + Jez[i, j-1])
                     if Jz_face > 0.0:
-                        T_up = Te[i, j]     # electrons move from j to j-1 (downwards)
-                    else:
-                        T_up = Te[i, j-1]   # electrons move from j-1 to j (upwards)
-                    F_z_bh = -alpha * T_up * Jz_face
-                else:
-                    Jz_face = Jez[i, j]
-                    if Jz_face > 0.0:
-                        # electrons go from cell down into masked region
+                        # electrons from j -> j-1
                         T_up = Te[i, j]
                     else:
-                        # electrons come from masked (below) into cell
-                        T_up = T_in_mask
-                    F_z_bh = -alpha * T_up * Jz_face
+                        # electrons from j-1 -> j
+                        T_up = Te[i, j-1]
+                else:
+                    Jz_face = Jez[i, j]
+                    T_up = Te[i, j]
+                F_z_bh = -alpha * T_up * Jz_face
+            # j==1: keep F_z_bh = 0
 
             # Divergence of advective enthalpy flux in RZ
             div_Fadv = (r_rh_face * F_r_rh - r_lh_face * F_r_lh) / (r_center * dr) + (F_z_th - F_z_bh) / dz
