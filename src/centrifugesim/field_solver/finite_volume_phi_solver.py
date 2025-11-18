@@ -162,8 +162,8 @@ def _compute_EJ_core(phi, mask, r, z,
                 if n_e < ne_floor:
                     n_e = ne_floor
                 inv_e_ne = 1.0 / (echarge * n_e)
-                jr += sigP   * (inv_e_ne * dpdr)
-                jz += sigPar * (inv_e_ne * dpdz)
+                jr += sigP   * (inv_e_ne * dpdr)*0
+                jz += sigPar * (inv_e_ne * dpdz)*0
 
             if use_rot:
                 jr += sigP * (Bz[i, j] * un_theta[i, j])
@@ -344,7 +344,6 @@ def _assemble_coefficients_core(
                         aS[i, j]  = 0.0
                     elif cathode_u8[i, j-1] == 1:
                         # Top of cathode: impose ∂φ/∂z = g_top_cathode[i]
-                        #ks = sigPar_n[i, j-1] if Nz > 1 else 0.0
                         ks = sigPar_n[i, j]
                         qzS = ks * g_top_cathode[i]
                         b[i, j] += r_c[i] * qzS / dz_j[j]
@@ -563,14 +562,14 @@ def compute_source_S(r, z,
 
     # --- "pressure battery" + neutral-rotation (Bz uθ) fluxes ---
     # radial fluxes: F_r = -σP*(1/e ne)*∂r pe - σP*(Bz uθ)
-    Fr = -sigP_e * inv_e_ne_e * dpdr_e
+    Fr = -sigP_e * inv_e_ne_e * dpdr_e*0
     if (Bz is not None) and (un_theta is not None):
         Bz_e = 0.5 * (Bz[:-1, :] + Bz[1:, :])
         u_e  = 0.5 * (un_theta[:-1, :] + un_theta[1:, :])
         Fr -= sigP_e * (Bz_e * u_e)
 
     # axial fluxes: F_z = -σ||*(1/e ne)*∂z pe
-    Fz = -sigPar_n * inv_e_ne_n * dpdz_n
+    Fz = -sigPar_n * inv_e_ne_n * dpdz_n*0
 
     if mask is not None:
         mu8 = (mask.astype(np.uint8) != 0)
