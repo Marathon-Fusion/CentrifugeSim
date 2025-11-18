@@ -62,7 +62,6 @@ class ElectronFluidContainer:
         # Short-hands
         ne = self.ne_grid
         Te = self.Te_grid
-        Bmag = hybrid_pic.Bmag_grid
 
         # Physical constants
         kb = constants.kb
@@ -76,7 +75,7 @@ class ElectronFluidContainer:
         tau_e  = 1.0 / nu_e
 
         # Electron gyrofrequency
-        Omega_e = np.abs(qe) * Bmag / me
+        Omega_e = np.abs(qe) * hybrid_pic.Bmag_grid / me
 
         # Parallel electron thermal conductivity (Spitzer–Härm with collisions folded into tau_e)
         Ck = 3.16  # Braginskii/Spitzer-Härm coefficient for electrons

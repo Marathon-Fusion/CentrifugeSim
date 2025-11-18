@@ -71,7 +71,7 @@ def electron_conductivities(
     Assumes: Z=1, ni = ne (quasineutral).
     """
     # |B|
-    Bmag += B_FLOOR
+    Bmag = np.where(Bmag < B_FLOOR, B_FLOOR, Bmag)
 
     # Electron gyrofrequency magnitude
     Omega_e = constants.q_e * Bmag / constants.m_e  # rad/s
@@ -101,13 +101,18 @@ def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
     All arrays are shape (NR, NZ). mask is int8 with 1=solve region, 0=masked.
     Explicit Euler for now just for testing, do not use for production runs.
     TO DO:
-        USE ne_floor instead of "tiny"
         Change to Douglas-ADI to get unconditionally stable behavior and larger timestep size.
     """
     NR, NZ = Te.shape
     kb = constants.kb
     qe = constants.q_e
-    tiny = 1e9  # avoid division by zero
+
+    # ---- user-settable electron 'inflow' temperature from masked regions (e.g., electrode)
+    #      If you know the electron temperature of the source feeding the masked region, set it here.
+    #      Using 0.0 prevents spurious energy injection when electrons enter from masked cells.
+    T_in_mask = 0.0
+
+    alpha = 2.5 * kb / qe
 
     for i in numba.prange(1, NR - 1):
         for j in range(1, NZ - 1):
@@ -115,6 +120,10 @@ def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
             if not (mask[i, j] == 1 and n_e[i, j] > 0.0):
                 # Leave Te_new untouched for masked/vacuum cells
                 continue
+
+            # =========================
+            # Conduction
+            # =========================
 
             # --- Right face (i+1/2, j) ---
             qr_rh = 0.0
@@ -202,72 +211,104 @@ def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
             div_q = div_qr_term + div_qz_term
 
             # =========================
-            # Enthalpy advection (conservative (J,T) form, upwind T only)
+            # Advection (electron enthalpy)
             # =========================
-            # Right face i+1/2 (no flux if neighbor masked)
+
+            # helper: face-average current; for masked neighbor use single-sided value from interior cell
+            # and determine upstream T along electron velocity (-J)
+            # Right face i+1/2
             F_r_rh = 0.0
-            if i < NR - 1 and mask[i+1, j] == 1:
-                Jr_face = 0.5 * (Jer[i, j] + Jer[i+1, j])
-                if Jr_face > 0.0:
-                    T_up = Te[i, j]
+            Jr_face = 0.0
+            if i < NR - 1:
+                if mask[i+1, j] == 1:
+                    Jr_face = 0.5 * (Jer[i, j] + Jer[i+1, j])
+                    # upwind along electron velocity => opposite to J
+                    if Jr_face > 0.0:
+                        T_up = Te[i+1, j]   # electrons move from right to left
+                    else:
+                        T_up = Te[i, j]     # electrons move from left to right
+                    F_r_rh = -alpha * T_up * Jr_face
                 else:
-                    T_up = Te[i+1, j]
-                F_r_rh = -(2.5 * kb / qe) * T_up * Jr_face
+                    # masked neighbor: use one-sided J and boundary inflow temperature when needed
+                    Jr_face = Jer[i, j]
+                    if Jr_face > 0.0:
+                        # electrons come from masked neighbor (upwind is masked)
+                        T_up = T_in_mask
+                    else:
+                        # electrons come from interior cell
+                        T_up = Te[i, j]
+                    F_r_rh = -alpha * T_up * Jr_face
 
             # Left face i-1/2
             F_r_lh = 0.0
-            if i > 1 and mask[i-1, j] == 1:
-                Jr_face = 0.5 * (Jer[i, j] + Jer[i-1, j])
-                if Jr_face > 0.0:
-                    T_up = Te[i-1, j]
+            Jr_face = 0.0
+            if i > 1:
+                if mask[i-1, j] == 1:
+                    Jr_face = 0.5 * (Jer[i, j] + Jer[i-1, j])
+                    if Jr_face > 0.0:
+                        T_up = Te[i, j]     # electrons move from i to i-1
+                    else:
+                        T_up = Te[i-1, j]   # electrons move from i-1 to i
+                    F_r_lh = -alpha * T_up * Jr_face
                 else:
-                    T_up = Te[i, j]
-                F_r_lh = -(2.5 * kb / qe) * T_up * Jr_face
+                    Jr_face = Jer[i, j]
+                    if Jr_face > 0.0:
+                        # electrons come from interior (i) to masked
+                        T_up = Te[i, j]
+                    else:
+                        # electrons come from masked neighbor into cell
+                        T_up = T_in_mask
+                    F_r_lh = -alpha * T_up * Jr_face
 
             # Top face j+1/2
             F_z_th = 0.0
-            if j < NZ - 1 and mask[i, j+1] == 1:
-                Jz_face = 0.5 * (Jez[i, j] + Jez[i, j+1])
-                if Jz_face > 0.0:
-                    T_up = Te[i, j]
+            Jz_face = 0.0
+            if j < NZ - 1:
+                if mask[i, j+1] == 1:
+                    Jz_face = 0.5 * (Jez[i, j] + Jez[i, j+1])
+                    if Jz_face > 0.0:
+                        T_up = Te[i, j+1]   # electrons move from top to bottom
+                    else:
+                        T_up = Te[i, j]     # electrons move from bottom to top
+                    F_z_th = -alpha * T_up * Jz_face
                 else:
-                    T_up = Te[i, j+1]
-                F_z_th = -(2.5 * kb / qe) * T_up * Jz_face
+                    Jz_face = Jez[i, j]
+                    if Jz_face > 0.0:
+                        # electrons come from masked (above) into cell
+                        T_up = T_in_mask
+                    else:
+                        # electrons go from cell up to masked region
+                        T_up = Te[i, j]
+                    F_z_th = -alpha * T_up * Jz_face
 
             # Bottom face j-1/2
             F_z_bh = 0.0
-            if j > 1 and mask[i, j-1] == 1:
-                Jz_face = 0.5 * (Jez[i, j] + Jez[i, j-1])
-                if Jz_face > 0.0:
-                    T_up = Te[i, j-1]
+            Jz_face = 0.0
+            if j > 1:
+                if mask[i, j-1] == 1:
+                    Jz_face = 0.5 * (Jez[i, j] + Jez[i, j-1])
+                    if Jz_face > 0.0:
+                        T_up = Te[i, j]     # electrons move from j to j-1 (downwards)
+                    else:
+                        T_up = Te[i, j-1]   # electrons move from j-1 to j (upwards)
+                    F_z_bh = -alpha * T_up * Jz_face
                 else:
-                    T_up = Te[i, j]
-                F_z_bh = -(2.5 * kb / qe) * T_up * Jz_face
+                    Jz_face = Jez[i, j]
+                    if Jz_face > 0.0:
+                        # electrons go from cell down into masked region
+                        T_up = Te[i, j]
+                    else:
+                        # electrons come from masked (below) into cell
+                        T_up = T_in_mask
+                    F_z_bh = -alpha * T_up * Jz_face
 
             # Divergence of advective enthalpy flux in RZ
             div_Fadv = (r_rh_face * F_r_rh - r_lh_face * F_r_lh) / (r_center * dr) + (F_z_th - F_z_bh) / dz
-
-            # -----------------------------------
-            # TO DO:
-            #      Change this to BC that accounts for Jez and kappa_parallel at cathode exit plane
-            # Corrections for masked faces (no-flux enforced, so add back missing fluxes)
-            
-            S_mask = 0.0
-            # radial corrections (RZ weighting)
-            if mask[i+1, j] == 0:  # right face missing
-                S_mask += (2.5 * kb / qe) * Te[i, j] * ( (r_rh_face / (r_center * dr)) * Jer[i, j] )
-            if mask[i-1, j] == 0 and i > 1:  # left face missing
-                S_mask -= (2.5 * kb / qe) * Te[i, j] * ( (r_lh_face / (r_center * dr)) * Jer[i, j] )
-
-            # axial corrections
-            if mask[i, j+1] == 0:  # top face missing
-                S_mask += (2.5 * kb / qe) * Te[i, j] * ( Jez[i, j] / dz )
-            if mask[i, j-1] == 0 and j > 1:  # bottom face missing
-                S_mask -= (2.5 * kb / qe) * Te[i, j] * ( Jez[i, j] / dz )
-
+          
             # =========================
             # Update
             # =========================
-            rhs = -div_q - div_Fadv + Q_Joule[i, j] + S_mask 
+            #rhs = -div_q - div_Fadv + Q_Joule[i, j]
+            rhs = -div_q + Q_Joule[i, j]
             dTe_dt = (2.0 / (3.0 * n_e[i, j] * kb)) * rhs
             Te_new[i, j] = Te[i, j] + dt * dTe_dt
