@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Iterable, Optional, Tuple, Union
+from typing import Callable, Dict, Iterable, Optional, Tuple, Union, Set, List
 import logging
 import math
 import ast
@@ -14,10 +14,7 @@ from centrifugesim import constants
 from centrifugesim.geometry.geometry import Geometry
 from centrifugesim.fluids.neutral_fluid import NeutralFluidContainer
 from centrifugesim.fluids.electron_fluid import ElectronFluidContainer
-from centrifugesim.particles.particle_container import ParticleContainer
-
-from centrifugesim.initialization.init_particles import initialize_ions_from_ni_nppc
-from centrifugesim.chemistry.chemistry_helper import update_Te_inelastic
+from centrifugesim.chemistry.chemistry_helper import compute_dTe_inelastic
 
 try:
     from centrifugesim.chemistry.maxwellian_rates import (
@@ -25,13 +22,10 @@ try:
         kelvin_from_eV,
         eval_rate_map_numba
     )
-except Exception as e:  # pragma: no cover
+except Exception as e:
     raise ImportError(
-        "Failed to import 'build_rate_table_and_interpolator' from "
-        "'centrifugesim.chemistry.maxwellian_rates'. "
-        "Ensure centrifugesim is installed and importable."
+        "Failed to import 'centrifugesim.chemistry.maxwellian_rates'. "
     ) from e
-
 
 Number = Union[int, float]
 log = logging.getLogger(__name__)
@@ -102,6 +96,16 @@ def _compile_rate_expression(expr: str) -> Callable[[float], float]:
 
 
 # ----------------------- Data model -----------------------
+@dataclass(frozen=True)
+class SpontaneousRate:
+    """
+    Container for a spontaneous emission transition.
+    Process: Reactant -> Product + hν (photon ignored for fluid density)
+    Rate: dn/dt = -A * n
+    """
+    reactant: str
+    product: str
+    A: float  # Einstein coefficient [1/s]
 
 @dataclass(frozen=True)
 class ReactionRate:
@@ -110,16 +114,30 @@ class ReactionRate:
     """
     name: str
     path: Path
-    rtype: str                       # internal storage (IONIZATION, RECOMBINATION, ELASTIC, ...)
-    process: Optional[str]           # human-readable reaction string
+    rtype: str                       # internal storage (IONIZATION, RECOMBINATION, EXCITATION, ELASTIC, ...)
+    process: [str]                  # human-readable reaction string
     k_grid_m3s: "list[float] | tuple | 'np.ndarray'"
     k_interp: Callable[[float], float]
     meta: dict
+
+    # --- Pre-computed kinetic parameters ---
+    
+    # Exponents for rate calc: R = k * (ne ** ne_order) * Product(n_s ** order for s in neutral_reactants)
+    ne_order: int
+    
+    # Map of {species_name: order} for neutral reactants (e.g. {'H(1S)': 1})
+    neutral_reactants: Dict[str, int]
+    
+    # Net change per reaction event: 
+    # 'ne': +1/-1 (net electron change)
+    # 'species': {'H(1S)': -1, 'H(2P)': +1, ...} (net neutral species change)
+    net_changes_ne: int
+    net_changes_species: Dict[str, int]
+
     delta_E_eV: float = 0.0          # optional energy change per reaction (eV)
 
     @property
     def type(self) -> str:
-        """Alias so callers can use reaction.type, as you requested."""
         return self.rtype
 
 
@@ -157,6 +175,7 @@ class Chemistry:
         self,
         cross_sections_dir: Optional[Union[str, Path]] = None,
         rate_coefficients_dir: Optional[Union[str, Path]] = None,
+        spontaneous_dir: Optional[Union[str, Path]] = None,
         *,
         Te_min_eV: float = 0.05,
         Te_max_eV: float = 25.0,
@@ -180,14 +199,23 @@ class Chemistry:
             cross_sections_dir = Path.cwd() / "cross_sections"
         if rate_coefficients_dir is None:
             rate_coefficients_dir = Path.cwd() / "rate_coefficients"
+        if spontaneous_dir is None:
+            spontaneous_dir = Path.cwd() / "spontaneous_emission"
+
         self.cross_sections_dir: Path = Path(cross_sections_dir)
         self.rate_coefficients_dir: Path = Path(rate_coefficients_dir)
+        self.spontaneous_dir: Path = Path(spontaneous_dir)
 
         # Placeholders populated during load
         self.Te_grid_K = None  # will become array-like
         self.reactions: Dict[str, ReactionRate] = {}
+        self.spontaneous_reactions: List[SpontaneousRate] = []
+
+        # Unique list of species (e.g. "H", "H+", "Ar") excluding "E", "hν"
+        self.species_list: List[str] = []
 
         self._load_all()
+        self._load_spontaneous()
 
     # ------------------------- Public API ---------------------------------
 
@@ -292,112 +320,130 @@ class Chemistry:
         return {"name": name, "rtype": rtype, "process": process, "expr": expr, "units": units}
 
     def _load_all(self) -> None:
-        """
-        Scan directories and build all reactions.
-        Ensures Te_grid_K is identical across all reactions.
-        """
+        found_species = set()
+        
         # 1) Cross sections
-        if self.cross_sections_dir.exists() and self.cross_sections_dir.is_dir():
-            cs_files = sorted(self.cross_sections_dir.glob("*.txt"))
-        else:
-            cs_files = []
-
-        shared_Te_tuple: Optional[Tuple] = None
+        cs_files = sorted(self.cross_sections_dir.glob("*.txt")) if self.cross_sections_dir.is_dir() else []
+        shared_Te_tuple = None
 
         for path in cs_files:
             name = path.stem
             rtype, process, header_meta = self._parse_cs_header(path)
-            Te_grid_K, k_grid_m3s, k_interp, meta = build_rate_table_and_interpolator(
-                path,
-                Te_min_K=self.Te_min_K,
-                Te_max_K=self.Te_max_K,
-                n_T=self._n_T,
-                spacing=self._spacing,
-            )
+            
+            if process:
+                found_species.update(self._extract_species_names(process))
 
+            Te_grid_K, k_grid_m3s, k_interp, meta = build_rate_table_and_interpolator(
+                path, Te_min_K=self.Te_min_K, Te_max_K=self.Te_max_K,
+                n_T=self._n_T, spacing=self._spacing,
+            )
             delta_E_eV = self._extract_delta_E_eV_from_file(path)
 
             if self.Te_grid_K is None:
                 self.Te_grid_K = Te_grid_K
                 try:
                     shared_Te_tuple = tuple(Te_grid_K)
-                except TypeError:
-                    shared_Te_tuple = None
-                log.debug("Set shared Te_grid_K from %s", path.name)
+                except TypeError: shared_Te_tuple = None
             else:
-                # enforce identical grid
-                if shared_Te_tuple is not None:
-                    try:
-                        if tuple(Te_grid_K) != shared_Te_tuple:
-                            raise ValueError(
-                                f"Te_grid_K mismatch for '{path.name}'. "
-                                "All reactions must share the exact same Te grid."
-                            )
-                    except TypeError:
-                        if not self._grids_equal(self.Te_grid_K, Te_grid_K):
-                            raise ValueError(
-                                f"Te_grid_K mismatch for '{path.name}'. "
-                                "All reactions must share the exact same Te grid."
-                            )
+                if shared_Te_tuple and tuple(Te_grid_K) != shared_Te_tuple:
+                     raise ValueError(f"Te_grid_K mismatch for '{path.name}'.")
 
+            ne_ord, n_react, dn_e, dn_s = self._analyze_stoichiometry(process)
+            
             meta_all = {**meta, **header_meta, "source": "cross_section"}
             self.reactions[name] = ReactionRate(
-                name=name,
-                path=path,
-                rtype=rtype,
-                process=process,
-                k_grid_m3s=k_grid_m3s,
-                k_interp=k_interp,
-                meta=meta_all,
-                delta_E_eV=delta_E_eV,
+                name=name, path=path, rtype=rtype, process=process,
+                k_grid_m3s=k_grid_m3s, k_interp=k_interp, meta=meta_all,
+                ne_order=ne_ord, neutral_reactants=n_react,
+                net_changes_ne=dn_e, net_changes_species=dn_s,
+                delta_E_eV=delta_E_eV
             )
 
         # 2) Analytic rate coefficients
-        if self.rate_coefficients_dir.exists() and self.rate_coefficients_dir.is_dir():
-            rc_files = sorted(self.rate_coefficients_dir.glob("*.txt"))
-        else:
-            rc_files = []
-
+        rc_files = sorted(self.rate_coefficients_dir.glob("*.txt")) if self.rate_coefficients_dir.is_dir() else []
         if not self.reactions and not rc_files:
-            raise FileNotFoundError(
-                f"No reactions found. Checked: {self.cross_sections_dir} and {self.rate_coefficients_dir}"
-            )
-
-        # Ensure we have a Te grid for expressions even if there were no cross sections
+             raise FileNotFoundError(f"No reactions found.")
+        
         if self.Te_grid_K is None:
             self._build_te_grid()
-            shared_Te_tuple = tuple(self.Te_grid_K) if self.Te_grid_K is not None else None
 
         for path in rc_files:
             info = self._parse_rate_file(path)
+            if info["process"]:
+                found_species.update(self._extract_species_names(info["process"]))
+
             expr_func = _compile_rate_expression(info["expr"])
-
-            # k_interp: direct evaluation
-            def k_interp_local(Te_K: float, _f=expr_func) -> float:
-                return float(_f(Te_K))
-
-            # k_grid sampled on the shared grid
+            def k_interp_local(Te_K: float, _f=expr_func) -> float: return float(_f(Te_K))
             k_grid = [k_interp_local(T) for T in self.Te_grid_K]
 
             name = info["name"]
-            if name in self.reactions:
-                log.warning("Reaction '%s' already exists; analytic file %s will overwrite.", name, path.name)
-            self.reactions[name] = ReactionRate(
-                name=name,
-                path=path,
-                rtype=info["rtype"],
-                process=info["process"],
-                k_grid_m3s=k_grid,
-                k_interp=k_interp_local,
-                meta={
-                    "source": "analytic_expression",
-                    "expr": info["expr"],
-                    "units": info["units"],
-                },
-            )
+            ne_ord, n_react, dn_e, dn_s = self._analyze_stoichiometry(info["process"])
+            
+            delta_E_eV = self._extract_delta_E_eV_from_file(path)
 
-        if not self.reactions:
-            raise RuntimeError("No reactions loaded.")
+            self.reactions[name] = ReactionRate(
+                name=name, path=path, rtype=info["rtype"], process=info["process"],
+                k_grid_m3s=k_grid, k_interp=k_interp_local,
+                meta={"source": "analytic", "expr": info["expr"], "units": info["units"]},
+                ne_order=ne_ord, neutral_reactants=n_react,
+                net_changes_ne=dn_e, net_changes_species=dn_s,
+                delta_E_eV=delta_E_eV
+            )
+        
+        self.species_list = sorted(list(found_species))
+
+    def _load_spontaneous(self) -> None:
+        """
+        Loads spontaneous emission rates from 'spontaneous_emission.txt'
+        Format: H(3S) -> H(2P), A = 6.32e6
+        """
+        filename = "spontaneous_emission.txt"
+        path = self.spontaneous_dir / filename
+        
+        if not path.exists():
+            log.info(f"No spontaneous emission file found at {path}")
+            return
+
+        try:
+            with path.open("r", encoding="utf-8", errors="ignore") as fh:
+                for line in fh:
+                    s = line.strip()
+                    if not s or s.startswith("#") or s.startswith("["):
+                         # Skip comments or source tags like 
+                        continue
+                    
+                    # Expected: "H(3S) -> H(2P), A = 6.32e6"
+                    # 1. Split reaction and A coeff
+                    if "," not in s:
+                        continue
+                    
+                    reaction_part, meta_part = s.split(",", 1)
+                    
+                    # 2. Parse A coefficient
+                    # Look for A = ...
+                    m = re.search(r"A\s*=\s*([+\-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+\-]?\d+)?)", meta_part)
+                    if not m:
+                        continue
+                    A_val = float(m.group(1))
+                    
+                    # 3. Parse Reactant -> Product
+                    if "->" not in reaction_part:
+                        continue
+                    
+                    lhs, rhs = reaction_part.split("->", 1)
+                    reactant = lhs.strip()
+                    product = rhs.strip()
+                    
+                    self.spontaneous_reactions.append(
+                        SpontaneousRate(reactant=reactant, product=product, A=A_val)
+                    )
+                    
+                    # Add to species list if not present (ignoring photons if any)
+                    if reactant not in self.species_list: self.species_list.append(reactant)
+                    if product not in self.species_list: self.species_list.append(product)
+
+        except Exception as e:
+            log.error(f"Failed to load spontaneous emission file: {e}")
 
     @staticmethod
     def _grids_equal(a, b) -> bool:
@@ -430,135 +476,286 @@ class Chemistry:
                         )
                         if m:
                             return float(m.group(1))
-        except Exception as e:
-            return 0.0
+        except Exception:
+            # If file read fails, just return 0.0
+            pass
+            
+        # Fallback if no matching PARAM line was found in the file
+        return 0.0
+
+    def _extract_species_names(self, process: str) -> Set[str]:
+        """Return set of unique species names (ignoring e, hv, and IONS)."""
+        if not process: return set()
+        ignore = {'e', 'e-', 'electron', 'hv', 'hν'}
+        species = set()
+        
+        tokens = re.split(r"->|,|\s+\+\s+", process)
+        
+        for tok in tokens:
+            t = tok.strip()
+            if not t: continue
+            
+            # 1. Ignore electrons and photons
+            if t.lower() in ignore:
+                continue
+                
+            # 2. Ignore Ions (any token containing '+')
+            # This handles "H+" or "Ar+" so they aren't added as neutral species.
+            if '+' in t:
+                continue
+                
+            species.add(t)
+        return species
+
+    def _analyze_stoichiometry(self, process: str) -> Tuple[int, Dict[str, int], int, Dict[str, int]]:
+        """
+        Returns:
+          ne_order (int): Power of ne in rate eq.
+          neutral_reactants (dict): {species_name: power} for neutrals in rate eq.
+          net_changes_ne (int): Change in electron count per event.
+          net_changes_species (dict): Change in count per species per event.
+        """
+        if not process or not isinstance(process, str):
+             return 0, {}, 0, {}
+
+        try:
+            left_str, right_str = process.split("->", 1)
+        except ValueError:
+            left_str, right_str = process, ""
+        
+        def _parse_side(side_str):
+            # We separate 'strict electrons' (e) from 'ions' (+)
+            counts = {'e_strict': 0, 'ions': 0, 'species': {}}
+            tokens = re.split(r"\s+\+\s+|\s*,\s*", side_str.strip())
+            for tok in tokens:
+                t = tok.strip()
+                if not t: continue
+                t_lower = t.lower()
+                
+                if t_lower in {"e", "e-", "electron"}:
+                    counts['e_strict'] += 1
+                elif "hv" in t_lower or "hν" in t_lower:
+                    pass 
+                else:
+                    if '+' in t:
+                        # It is an ion (e.g. H+). 
+                        # It affects Kinetics (LHS) but is not a 'neutral species' 
+                        # and is not an 'electron' for stoichiometry.
+                        counts['ions'] += 1
+                    else:
+                        # It is a neutral species (H(1S), etc)
+                        c = counts['species'].get(t, 0)
+                        counts['species'][t] = c + 1
+            return counts
+
+        left = _parse_side(left_str)
+        right = _parse_side(right_str)
+
+        # 1. Kinetic Order (LHS only)
+        # Rate ~ [e]^(e_strict + ions) * [neutrals]
+        ne_order = left['e_strict'] + left['ions']
+        neutral_reactants = left['species']
+
+        # 2. Stoichiometric Change (Right - Left)
+        # Strictly track electrons for the electron fluid update
+        delta_ne = right['e_strict'] - left['e_strict']
+        
+        delta_species = {}
+        all_species = set(left['species']) | set(right['species'])
+        for s in all_species:
+            change = right['species'].get(s, 0) - left['species'].get(s, 0)
+            if change != 0:
+                delta_species[s] = change
+
+        return ne_order, neutral_reactants, delta_ne, delta_species
 
 
-    def do_ionization(
+    def do_electron_inelastic_collisions(
         self,
         geom: Geometry,
         electron_fluid: ElectronFluidContainer,
         neutral_fluid: NeutralFluidContainer,
-        particle_container: ParticleContainer,
-        Te_min_eV_ionization: float,
-        nppc_new: int,
         dt: float,
-        ) -> "np.ndarray":
+    ) -> None:
         """
-        Advance electron temperature by one explicit step including 
-        ionization energy losses.
-
-        d/dt ( 3/2 * k_b * n_e * T_e ) = - n_e * n_n * k_ion(T_e) * ΔE_ion
-
-        Where:
-        - k_ion(T_e) [m^3/s] is evaluated at Te (Kelvin) using the pre-built
-            ionization rate table/interpolator
-        - ΔE_ion is ionization energy (J) for the reaction (e.g., 13.6 eV for H)
-
-        Updates electron_fluid.Te_grid IN-PLACE on nodes where mask == 1.
-        Returns the field k_ion * n_e * n_n * dt (requested for later use).
-
-        Parameters
-        ----------
-        electron_fluid : ElectronFluidContainer
-            Provides ne_grid [m^-3], Te_grid [K], ne_floor (float).
-        neutral_fluid : NeutralFluidContainer
-            Provides nn_grid [m^-3].
-        particle_container : ParticleContainer
-            Container to add newly created ions into.
-        nppc_new : int
-            Number of particles per cell for newly created ions.
-        dt : float
-            Time step [s].
-
-        Returns
-        -------
-        ne_nn_k_dt : np.ndarray
-            2D array: k_ion * n_e * n_n * dt on mask==1 nodes (0 outside mask).
+        Unified generalized inelastic collision loop.
+        Auto-detects dependencies from 'rate_exponents' and changes from 'net_changes'.
         """
-        # --- fetch mask (Geometry) robustly ---
-        mask = geom.mask
-
-        # --- field references ---
+        mask = geom.mask.astype(np.int8)
         ne = electron_fluid.ne_grid
         Te = electron_fluid.Te_grid
-        nn = neutral_fluid.nn_grid
 
-        # Safety shape checks
-        if not (ne.shape == Te.shape == nn.shape == mask.shape):
-            raise ValueError(
-                "Shape mismatch among grids. "
-                f"ne{ne.shape}, Te{Te.shape}, nn{nn.shape}, mask{mask.shape}"
+        if not hasattr(neutral_fluid, 'str_states_list') or not hasattr(neutral_fluid, 'list_nn_grid'):
+             raise AttributeError("NeutralFluidContainer must have str_states_list and list_nn_grid.")
+
+        # Create a map for quick index lookup: "H(1S)" -> 0
+        state_map = {name: i for i, name in enumerate(neutral_fluid.str_states_list)}
+        # Frozen Te for rate evaluation
+        Te0 = Te.copy()
+
+        delta_ne_total = np.zeros_like(ne, dtype=float)
+        delta_Te_total = np.zeros_like(Te, dtype=float)
+
+        # We need a delta buffer for EACH state grid
+        # To save memory, we could instantiate them on demand or use a dictionary of dense arrays
+        # simpler: dictionary of indices -> delta array
+        delta_nn_states: Dict[int, np.ndarray] = {}
+        
+        # Filter for reactions that actually change densities or have explicit energy cost
+        relevant_reactions = [
+            r for r in self.reactions.values()
+            if r.rtype in {"IONIZATION", "RECOMBINATION", "EXCITATION"} 
+        ]
+
+        for rxn in relevant_reactions:
+            # 1. Evaluate Rate Coefficient k(Te)
+            # Numba optimized evaluation
+            k_map = eval_rate_map_numba(
+                mask.astype(np.int64),
+                np.asarray(self.Te_grid_K),
+                np.asarray(rxn.k_grid_m3s),
+                np.asarray(Te0),
             )
 
-        # --- pick the ionization reaction (for now, there should be exactly one) ---
-        rxn = None
-        for r in self.reactions.values():
-            rtype = str(getattr(r, "type", "")).upper()
-            if rtype == "IONIZATION" or "ioniz" in r.name.lower():
-                rxn = r
-                break
-        if rxn is None:
-            # fallback: if there's exactly one, use it
-            if len(self.reactions) == 1:
-                rxn = next(iter(self.reactions.values()))
+            # 2. Build Rate Term R = k * ne^A * Product(n_species^B)
+            # ne term
+            if rxn.ne_order == 0:
+                term_ne = 1.0
+            elif rxn.ne_order == 1:
+                term_ne = ne
+            elif rxn.ne_order == 2:
+                term_ne = ne * ne
+            elif rxn.ne_order == 3:
+                term_ne = ne * ne * ne
             else:
-                raise RuntimeError("No IONIZATION reaction found in Chemistry.reactions")
+                term_ne = ne ** rxn.ne_order
 
-        # --- ionization energy [J] ---
-        # Prefer attribute (added earlier), else fallback to meta or 0.0
-        delta_E_eV = getattr(rxn, "delta_E_eV", None)
-        if delta_E_eV is None:
-            # try meta key if present
-            delta_E_eV = float((rxn.meta or {}).get("delta_E_eV", 0.0))
-        # robust conversion via Kelvin helper already imported in this module:
-        delta_E_J = float(constants.kb * kelvin_from_eV(float(delta_E_eV)))
+            # Neutral reactants term
+            term_nn = 1.0
+            valid_reaction = True
+            for spec, order in rxn.neutral_reactants.items():
+                if spec not in state_map:
+                    # Reactant species not tracked in fluid -> Reaction cannot proceed (or we ignore it)
+                    # Log warning once? For now, assume 0 rate if reactant missing
+                    valid_reaction = False
+                    break
+                
+                idx = state_map[spec]
+                # Access the specific 2D array for this state
+                n_s = neutral_fluid.list_nn_grid[idx]
+                
+                if order == 1:
+                    term_nn = term_nn * n_s
+                else:
+                    term_nn = term_nn * (n_s ** order)
+            
+            if not valid_reaction:
+                continue
 
-        # --- evaluate k_ion(Te) on masked nodes using provided numba function ---
-        # Note: eval_rate_map_numba writes only where mask==1; others are undefined,
-        # but our update kernel never reads them where mask==0.
-        k_ion_map = eval_rate_map_numba(
-            mask.astype(np.int64),
-            np.asarray(self.Te_grid_K),
-            np.asarray(rxn.k_grid_m3s),
-            np.asarray(Te),
-        )
+            R = k_map * term_ne * term_nn
+            events = R * dt  # [1/m^3]
 
-        if ((k_ion_map*nn*dt).max()>0.2):
-            print("WARNING: Large ionization fraction this step (>20%) may cause instability.")
+            # 3. Apply Changes
+            
+            # A) Electrons
+            if rxn.net_changes_ne != 0:
+                delta_ne_total += float(rxn.net_changes_ne) * events
+            
+            # B) Neutral Species
+            for spec, change in rxn.net_changes_species.items():
+                # Ignore ions (containing +) if they are not in list_states
+                if spec not in state_map:
+                    continue
+                
+                idx = state_map[spec]
+                if idx not in delta_nn_states:
+                    delta_nn_states[idx] = np.zeros_like(ne, dtype=float)
+                
+                delta_nn_states[idx] += float(change) * events
 
-        Te_min_K_ionization = kelvin_from_eV(Te_min_eV_ionization)
-        k_ion_map = np.where(Te >= Te_min_K_ionization, k_ion_map, 0.0)
+            # C) Energy
+            if rxn.delta_E_eV != 0.0:
+                dE_J = float(constants.kb * kelvin_from_eV(float(rxn.delta_E_eV)))
+                                    
+                delta_Te_total += compute_dTe_inelastic(
+                    mask.astype(np.int8),
+                    ne,
+                    R,
+                    -float(dE_J), 
+                    float(dt),
+                    float(electron_fluid.ne_floor),
+                )
 
-        # Extend here for multiple inelastic collisions and or ionization reactions in the future
-        # ...
-        # ...
-        # ...
+        # Commit fields
+        electron_fluid.Te_grid += delta_Te_total
+        electron_fluid.ne_grid += delta_ne_total
+        
+        # Update individual state grids
+        for idx, delta_grid in delta_nn_states.items():
+            neutral_fluid.list_nn_grid[idx] += delta_grid
 
-        # --- Numba-parallel in-place update (masked) ---
-        Te_new, delta_ne = update_Te_inelastic(
-            mask.astype(np.int8),
-            Te,
-            ne,
-            nn,
-            k_ion_map,
-            delta_E_J,
-            float(dt),
-            float(electron_fluid.ne_floor),
-        )
+        # Finalize Neutral Fluid
+        neutral_fluid.compute_nn_grid_from_states()
+        
+        neutral_fluid.update_rho()
+        neutral_fluid.update_p()
 
-        # commit updated temperature
-        electron_fluid.Te_grid[:, :] = Te_new
 
-        # Add new ions here using delta_ne
-        # commented, will do from accumulated delta_ne outside of electron loop
-        # w_p, r_p, z_p, vr_p, vt_p, vz_p = initialize_ions_from_ni_nppc(delta_ne, neutral_fluid.T_n_grid,
-        #                                                                geom.R, geom.Z, geom.dr, geom.dz,
-        #                                                                nppc_new, particle_container.m)                                                                        
-        # particle_container.add_from_numpy_arrays(geom, w_p, r_p, z_p, vr_p, vt_p, vz_p)
+    def do_spontaneous_emission(
+        self,
+        geom: Geometry,
+        neutral_fluid: NeutralFluidContainer,
+        dt: float,
+        ) -> None:
+        """
+        Updates neutral fluid states based on spontaneous emission (Einstein A coefficients).
+        Uses exponential decay formula to ensure stability if A*dt > 1.
+        """
+        if not self.spontaneous_reactions:
+            return
 
-        # Remove density from neutral gas
-        neutral_fluid.nn_grid[:, :] -= delta_ne
-        neutral_fluid.update_rho(); neutral_fluid.update_p()
+        if not hasattr(neutral_fluid, 'str_states_list') or not hasattr(neutral_fluid, 'list_nn_grid'):
+             raise AttributeError("NeutralFluidContainer must have str_states_list and list_nn_grid.")
 
-        return delta_ne
+        state_map = {name: i for i, name in enumerate(neutral_fluid.str_states_list)}
+        
+        # Accumulate changes to apply all at once (Operator Splitting)
+        # This prevents order-dependence (e.g. A->B and B->C in same step)
+        delta_nn_states: Dict[int, np.ndarray] = {}
+
+        for rxn in self.spontaneous_reactions:
+            # Check if both species exist in the simulation
+            if rxn.reactant not in state_map or rxn.product not in state_map:
+                continue
+            
+            idx_r = state_map[rxn.reactant]
+            idx_p = state_map[rxn.product]
+            
+            n_reactant = neutral_fluid.list_nn_grid[idx_r]
+            
+            # Physics: Exponential decay probability P = 1 - exp(-A*dt)
+            # This prevents n_reactant from going negative if A is large.
+            decay_factor = 1.0 - math.exp(-rxn.A * dt)
+            
+            # Density changing state
+            delta_n = n_reactant * decay_factor
+            
+            # Initialize buffers if needed
+            if idx_r not in delta_nn_states:
+                delta_nn_states[idx_r] = np.zeros_like(n_reactant)
+            if idx_p not in delta_nn_states:
+                delta_nn_states[idx_p] = np.zeros_like(n_reactant)
+            
+            # Apply conservation
+            delta_nn_states[idx_r] -= delta_n
+            delta_nn_states[idx_p] += delta_n
+
+        # Apply updates
+        for idx, delta in delta_nn_states.items():
+            neutral_fluid.list_nn_grid[idx] += delta
+            
+        # Recompute macroscopic moments if any changes occurred
+        if delta_nn_states:
+            neutral_fluid.compute_nn_grid_from_states()
+            neutral_fluid.update_rho()
+            neutral_fluid.update_p()

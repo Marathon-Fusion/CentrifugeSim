@@ -12,6 +12,9 @@ from centrifugesim import constants
 
 class HybridPICModel:
     def __init__(self, geom:Geometry, use_fem = False):
+
+        self.t = 0 # current simulation time (s)
+
         # geometry info
         self.zmin = geom.zmin
         self.Nr = geom.Nr

@@ -2,12 +2,13 @@ import numpy as np
 
 from centrifugesim.fluids import neutral_fluid_helper
 from centrifugesim.geometry.geometry import Geometry
+
 from centrifugesim import constants
 
 class NeutralFluidContainer:
     """
     """
-    def __init__(self, geom:Geometry, nn_floor, mass, name, kind, Tn0=0.0):
+    def __init__(self, geom:Geometry, species_list, nn_floor, mass, name, kind, Tn0=0.0):
 
         self.name = name
 
@@ -28,6 +29,10 @@ class NeutralFluidContainer:
         self.c_v = self.Rgas_over_m/(gamma - 1.0) # J/(kg·K)
         self.cp  = self.c_v + self.Rgas_over_m # J/(kg·K)
 
+        # For ground/excited states
+        self.str_states_list = species_list.copy()
+        self.list_nn_grid = [np.zeros((self.Nr, self.Nz)).astype(np.float64) for _ in species_list]
+
         self.nn_grid = np.zeros((self.Nr, self.Nz)).astype(np.float64)
         self.rho_grid = np.zeros((self.Nr, self.Nz)).astype(np.float64)
         self.p_grid = np.zeros((self.Nr, self.Nz)).astype(np.float64)
@@ -45,7 +50,18 @@ class NeutralFluidContainer:
 
         self.i_bc_list, self.j_bc_list = geom.i_bc_list.copy(), geom.j_bc_list.copy()
 
-        print(self.name + " initialized")
+        print("initialized")
+        print(self.str_states_list)
+        print()
+
+    def initialize_state(self, state_name, value):
+        idx = self.str_states_list.index(state_name)
+        self.list_nn_grid[idx][:,:] = value
+
+    def compute_nn_grid_from_states(self):
+        self.nn_grid[:,:] = 0.0
+        for i, species in enumerate(self.str_states_list):
+            self.nn_grid[:,:] += self.list_nn_grid[i][:,:]
 
     def update_rho(self):
         self.rho_grid[self.fluid==1] = self.mass*self.nn_grid[self.fluid==1]
