@@ -32,6 +32,8 @@ class NeutralFluidContainer:
         # For ground/excited states
         self.str_states_list = species_list.copy()
         self.list_nn_grid = [np.zeros((self.Nr, self.Nz)).astype(np.float64) for _ in species_list]
+        self.list_N_states = np.zeros(len(species_list)).astype(np.float64)
+        self.list_max_nn_states = np.zeros(len(species_list)).astype(np.float64)
 
         self.nn_grid = np.zeros((self.Nr, self.Nz)).astype(np.float64)
         self.rho_grid = np.zeros((self.Nr, self.Nz)).astype(np.float64)
@@ -62,6 +64,14 @@ class NeutralFluidContainer:
         self.nn_grid[:,:] = 0.0
         for i, species in enumerate(self.str_states_list):
             self.nn_grid[:,:] += self.list_nn_grid[i][:,:]
+
+    def compute_total_N_states(self, geom):
+        for i in range(len(self.str_states_list)):
+            self.list_N_states[i] = np.sum(self.list_nn_grid[i][geom.mask==1] * geom.volume_field[geom.mask==1])
+
+    def compute_max_nn_states(self, geom):
+        for i in range(len(self.str_states_list)):
+            self.list_max_nn_states[i] = np.max(self.list_nn_grid[i][geom.mask==1])
 
     def update_rho(self):
         self.rho_grid[self.fluid==1] = self.mass*self.nn_grid[self.fluid==1]

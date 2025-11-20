@@ -607,6 +607,7 @@ class Chemistry:
             if r.rtype in {"IONIZATION", "RECOMBINATION", "EXCITATION"} 
         ]
 
+        nu_max_all = 0.0
         for rxn in relevant_reactions:
             # 1. Evaluate Rate Coefficient k(Te)
             # Numba optimized evaluation
@@ -652,7 +653,22 @@ class Chemistry:
             if not valid_reaction:
                 continue
 
-            R = k_map * term_ne * term_nn
+            if(rxn.rtype == "EXCITATION" or rxn.rtype == "IONIZATION"):
+                nu = k_map * term_nn
+                R = nu * ne
+                
+                # Track maximum collision frequency for diagnostics
+                delta_E_eV = rxn.delta_E_eV
+                delta_E_J = constants.q_e * delta_E_eV
+
+                nu_Te_max = (nu[geom.mask==1]*abs(delta_E_J) / (1.5*constants.kb*Te0[geom.mask==1])).max()
+                nu_max = max(nu.max(), nu_Te_max)
+
+                if(nu_max > nu_max_all):
+                    nu_max_all = nu_max
+            else:
+                R = k_map * term_ne * term_nn
+
             events = R * dt  # [1/m^3]
 
             # 3. Apply Changes
@@ -676,7 +692,7 @@ class Chemistry:
             # C) Energy
             if rxn.delta_E_eV != 0.0:
                 dE_J = float(constants.kb * kelvin_from_eV(float(rxn.delta_E_eV)))
-                                    
+
                 delta_Te_total += compute_dTe_inelastic(
                     mask.astype(np.int8),
                     ne,
@@ -696,9 +712,10 @@ class Chemistry:
 
         # Finalize Neutral Fluid
         neutral_fluid.compute_nn_grid_from_states()
-        
         neutral_fluid.update_rho()
         neutral_fluid.update_p()
+
+        return nu_max_all
 
 
     def do_spontaneous_emission(
