@@ -482,7 +482,7 @@ class ParticleContainer:
         del ui_r, ui_t, ui_z
         cp._default_memory_pool.free_all_blocks()
 
-    def compute_weight_decay_recombination(self, geom, dt, nu_recombination_grid):
+    def compute_weight_decay_recombination_from_frequency(self, geom, dt, nu_recombination_grid):
         """
         Compute weight decay due to recombination.
         The weight decay is given by the formula:
@@ -506,6 +506,54 @@ class ParticleContainer:
             self.remove_indices_and_free_memory(ind_zero_weight)
         
         del nu_recombination_loc, decay_factor, nu_recombination_grid_d
+        cp._default_memory_pool.free_all_blocks()
+
+    def apply_recombination_from_density_change(self, geom, ni_prev, delta_ni_recombination_grid):
+        """
+        Reduces particle weights based on a pre-calculated DENSITY loss grid.
+        
+        Logic:
+            decay_factor = 1.0 - (delta_ni_recombination / current_ion_density)
+        """
+        if self.N == 0:
+            return
+        
+        # Move inputs to GPU
+        delta_ni_d = cp.asarray(delta_ni_recombination_grid).astype(cp.float32)
+        ni_grid_d = cp.asarray(ni_prev).astype(cp.float32)
+
+        # 2. Calculate Decay Factor Grid (1 - delta/total)
+        # Avoid division by zero: if ni is 0, decay is 1.0 (no change)
+        # We construct the factor: F = (ni - delta) / ni = 1 - delta/ni
+        
+        decay_grid_d = cp.ones_like(ni_grid_d)
+        
+        valid_mask = ni_grid_d > 1.0
+        
+        # Calculate ratio only where we have ions
+        ratio = cp.zeros_like(ni_grid_d)
+        ratio[valid_mask] = delta_ni_d[valid_mask] / ni_grid_d[valid_mask]
+        
+        # Safety Clamp: Ratio cannot exceed 1.0 (cannot remove more than 100%)
+        # If chemistry calculated delta > ni (due to sub-cycling vs particle drift),
+        # we cap it at removing 100% of the particles.
+        ratio = cp.clip(ratio, 0.0, 1.0)
+        
+        decay_grid_d -= ratio
+
+        # 3. Gather to particle positions
+        decay_factor_loc = self.gatherScalarField(decay_grid_d, geom.dr, geom.dz, geom.zmin)
+        
+        # 4. Apply
+        self.weight *= decay_factor_loc
+
+        # 5. Clean up dead particles
+        # (If ratio was 1.0, weight becomes 0.0)
+        ind_zero_weight = cp.flatnonzero(self.weight <= 1)
+        if ind_zero_weight.shape[0] > 0:
+            self.remove_indices_and_free_memory(ind_zero_weight)
+
+        del delta_ni_d, ni_grid_d, decay_grid_d, ratio, decay_factor_loc, valid_mask
         cp._default_memory_pool.free_all_blocks()
 
     def collide_with_neutrals_mcc(
