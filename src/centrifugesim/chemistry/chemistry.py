@@ -569,17 +569,116 @@ class Chemistry:
 
         return ne_order, neutral_reactants, delta_ne, delta_species
 
+    def compute_collision_frequencies(
+        self,
+        geom: Geometry,
+        electron_fluid: ElectronFluidContainer,
+        neutral_fluid: NeutralFluidContainer
+    ) -> Tuple[float, Dict[str, Dict[str, np.ndarray]]]:
+        """
+        Pre-calculates rate coefficients and collision frequencies.
+        Checks BOTH Electron generation frequency AND Neutral depletion frequency 
+        to determine the safe timestep.
+        
+        Returns:
+            max_freq (float): Maximum frequency (1/s) for dt limiting.
+            precomputed_data (dict): Cached maps for the solver loop.
+        """
+        if not hasattr(neutral_fluid, 'str_states_list') or not hasattr(neutral_fluid, 'list_nn_grid'):
+            raise AttributeError("NeutralFluidContainer must have str_states_list and list_nn_grid.")
 
-    def do_electron_inelastic_collisions(
+        mask = geom.mask.astype(np.int8)
+        Te = electron_fluid.Te_grid
+        ne = electron_fluid.ne_grid  # <--- Need ne for depletion check
+        
+        state_map = {name: i for i, name in enumerate(neutral_fluid.str_states_list)}
+        
+        max_freq = 0.0
+        precomputed_data = {}
+
+        relevant_reactions = [
+            r for r in self.reactions.values()
+            if r.rtype in {"IONIZATION", "RECOMBINATION", "EXCITATION"} 
+        ]
+
+        for rxn in relevant_reactions:
+            # 1. Evaluate Rate Coefficient k(Te)
+            k_map = eval_rate_map_numba(
+                mask.astype(np.int64),
+                np.asarray(self.Te_grid_K),
+                np.asarray(rxn.k_grid_m3s),
+                np.asarray(Te),
+            )
+
+            # 2. Build Neutral Reactants Term (term_nn)
+            term_nn = np.ones_like(Te) 
+            valid_reaction = True
+            for spec, order in rxn.neutral_reactants.items():
+                if spec not in state_map:
+                    valid_reaction = False
+                    break
+                idx = state_map[spec]
+                n_s = neutral_fluid.list_nn_grid[idx]
+                if order == 1: term_nn *= n_s
+                else:          term_nn *= (n_s ** order)
+            
+            if not valid_reaction:
+                zeros = np.zeros_like(k_map)
+                precomputed_data[rxn.name] = {'freq': zeros, 'k_map': zeros, 'term_nn': zeros}
+                continue
+
+            # 3. Build Electron Term (term_ne) for Depletion Check
+            # (How aggressive is this reaction toward the neutral?)
+            if rxn.ne_order == 0:   term_ne = np.ones_like(ne)
+            elif rxn.ne_order == 1: term_ne = ne
+            else:                   term_ne = ne ** rxn.ne_order
+
+            # 4. Calculate Frequencies
+            
+            # Freq A: Electron Fluid Evolution timescale (e.g. ionization freq)
+            # This drives how fast ne changes.
+            freq_electron_ev = k_map * term_nn
+
+            # Freq B: Neutral Depletion timescale
+            # This drives how fast the neutral state dies.
+            # Only relevant if the reaction actually consumes a neutral reactant.
+            freq_neutral_loss = np.zeros_like(k_map)
+            if rxn.neutral_reactants:
+                freq_neutral_loss = k_map * term_ne
+
+            # 5. Update Max Frequency (Check BOTH)
+            # We mask outside regions to avoid artifacts
+            
+            # Check Electron Limit
+            current_max_e = np.max(np.where(mask > 0, freq_electron_ev, 0.0))
+            if current_max_e > max_freq:
+                max_freq = current_max_e
+                
+            # Check Neutral Depletion Limit (CRITICAL for excited states)
+            current_max_n = np.max(np.where(mask > 0, freq_neutral_loss, 0.0))
+            if current_max_n > max_freq:
+                max_freq = current_max_n
+
+            # 6. Store Data (We strictly save freq_electron_ev for the Rate equation R = freq * ne)
+            precomputed_data[rxn.name] = {
+                'freq': freq_electron_ev, 
+                'k_map': k_map,
+                'term_nn': term_nn
+            }
+
+        return max_freq, precomputed_data
+
+    def do_electron_inelastic_collisions_safe_but_slow(
         self,
         geom: Geometry,
         electron_fluid: ElectronFluidContainer,
         neutral_fluid: NeutralFluidContainer,
         dt: float,
+        precomputed_data: Dict[str, Dict[str, np.ndarray]],
     ) -> None:
         """
         Unified generalized inelastic collision loop.
-        Auto-detects dependencies from 'rate_exponents' and changes from 'net_changes'.
+        Uses precomputed 'freq' (k * term_nn) to optimize performance.
         """
         mask = geom.mask.astype(np.int8)
         ne = electron_fluid.ne_grid
@@ -588,37 +687,26 @@ class Chemistry:
         if not hasattr(neutral_fluid, 'str_states_list') or not hasattr(neutral_fluid, 'list_nn_grid'):
              raise AttributeError("NeutralFluidContainer must have str_states_list and list_nn_grid.")
 
-        # Create a map for quick index lookup: "H(1S)" -> 0
         state_map = {name: i for i, name in enumerate(neutral_fluid.str_states_list)}
-        # Frozen Te for rate evaluation
-        Te0 = Te.copy()
 
         delta_ne_total = np.zeros_like(ne, dtype=float)
         delta_Te_total = np.zeros_like(Te, dtype=float)
-
-        # We need a delta buffer for EACH state grid
-        # To save memory, we could instantiate them on demand or use a dictionary of dense arrays
-        # simpler: dictionary of indices -> delta array
         delta_nn_states: Dict[int, np.ndarray] = {}
         
-        # Filter for reactions that actually change densities or have explicit energy cost
         relevant_reactions = [
             r for r in self.reactions.values()
             if r.rtype in {"IONIZATION", "RECOMBINATION", "EXCITATION"} 
         ]
 
         for rxn in relevant_reactions:
-            # 1. Evaluate Rate Coefficient k(Te)
-            # Numba optimized evaluation
-            k_map = eval_rate_map_numba(
-                mask.astype(np.int64),
-                np.asarray(self.Te_grid_K),
-                np.asarray(rxn.k_grid_m3s),
-                np.asarray(Te0),
-            )
+            if rxn.name not in precomputed_data:
+                continue
+            
+            # 1. Retrieve precomputed frequency
+            # freq = k(Te) * term_nn
+            freq_map = precomputed_data[rxn.name]['freq']
 
-            # 2. Build Rate Term R = k * ne^A * Product(n_species^B)
-            # ne term
+            # 2. Build Electron Term (term_ne)
             if rxn.ne_order == 0:
                 term_ne = 1.0
             elif rxn.ne_order == 1:
@@ -630,32 +718,12 @@ class Chemistry:
             else:
                 term_ne = ne ** rxn.ne_order
 
-            # Neutral reactants term
-            term_nn = 1.0
-            valid_reaction = True
-            for spec, order in rxn.neutral_reactants.items():
-                if spec not in state_map:
-                    # Reactant species not tracked in fluid -> Reaction cannot proceed (or we ignore it)
-                    # Log warning once? For now, assume 0 rate if reactant missing
-                    valid_reaction = False
-                    break
-                
-                idx = state_map[spec]
-                # Access the specific 2D array for this state
-                n_s = neutral_fluid.list_nn_grid[idx]
-                
-                if order == 1:
-                    term_nn = term_nn * n_s
-                else:
-                    term_nn = term_nn * (n_s ** order)
-            
-            if not valid_reaction:
-                continue
+            # 3. Calculate Total Rate R
+            # R = (k * term_nn) * term_ne
+            R = freq_map * term_ne
+            events = R * dt 
 
-            R = k_map * term_ne * term_nn
-            events = R * dt  # [1/m^3]
-
-            # 3. Apply Changes
+            # 4. Apply Changes
             
             # A) Electrons
             if rxn.net_changes_ne != 0:
@@ -663,7 +731,6 @@ class Chemistry:
             
             # B) Neutral Species
             for spec, change in rxn.net_changes_species.items():
-                # Ignore ions (containing +) if they are not in list_states
                 if spec not in state_map:
                     continue
                 
@@ -676,7 +743,7 @@ class Chemistry:
             # C) Energy
             if rxn.delta_E_eV != 0.0:
                 dE_J = float(constants.kb * kelvin_from_eV(float(rxn.delta_E_eV)))
-                                    
+
                 delta_Te_total += compute_dTe_inelastic(
                     mask.astype(np.int8),
                     ne,
@@ -693,13 +760,353 @@ class Chemistry:
         # Update individual state grids
         for idx, delta_grid in delta_nn_states.items():
             neutral_fluid.list_nn_grid[idx] += delta_grid
+            np.maximum(neutral_fluid.list_nn_grid[idx], 0.0, out=neutral_fluid.list_nn_grid[idx])
 
         # Finalize Neutral Fluid
         neutral_fluid.compute_nn_grid_from_states()
+        neutral_fluid.update_rho()
+        neutral_fluid.update_p()
         
+    def do_electron_inelastic_collisions(
+        self,
+        geom: Geometry,
+        electron_fluid: ElectronFluidContainer,
+        neutral_fluid: NeutralFluidContainer,
+        dt: float,
+        precomputed_data: Dict[str, Dict[str, np.ndarray]],
+    ) -> None:
+        """
+        Unified generalized inelastic collision loop with ADAPTIVE SUB-CYCLING.
+        
+        Logic:
+          1. Uses global 'dt' (externally set, potentially large).
+          2. For each reaction, calculates a local stiffness (max_freq).
+          3. Determines required sub-steps N to maintain stability (freq * dt_sub < 0.1).
+          4. Loops N times, re-evaluating density terms to ensure strict mass conservation
+             and depletion physics, while keeping k(Te) frozen for performance.
+        """
+        mask = geom.mask.astype(np.int8)
+        
+        # Direct access to mutable arrays for in-place updates (Conservation requirement)
+        ne = electron_fluid.ne_grid
+        Te = electron_fluid.Te_grid # Used for Energy update only (rates are frozen)
+        
+        if not hasattr(neutral_fluid, 'str_states_list') or not hasattr(neutral_fluid, 'list_nn_grid'):
+             raise AttributeError("NeutralFluidContainer must have str_states_list and list_nn_grid.")
+
+        state_map = {name: i for i, name in enumerate(neutral_fluid.str_states_list)}
+        
+        relevant_reactions = [
+            r for r in self.reactions.values()
+            if r.rtype in {"IONIZATION", "RECOMBINATION", "EXCITATION"} 
+        ]
+
+        for rxn in relevant_reactions:
+            if rxn.name not in precomputed_data:
+                continue
+            
+            # 1. Retrieve frozen Rate Coefficient
+            # We trust k(Te) varies slowly compared to density depletion
+            data = precomputed_data[rxn.name]
+            k_map = data['k_map'] 
+            
+            # 2. Determine Stiffness (Number of Sub-steps)
+            # We need to estimate the CURRENT max frequency to pick N.
+            # We can use the pre-calculated 'freq' (k*nn) and 'term_nn' from the precompute step
+            # as a good-enough estimate for the start of the timestep.
+            
+            # Retrieve cached frequency (Ionization/Generation timescale)
+            freq_gen_est = data['freq'] 
+            
+            # Estimate Depletion frequency (Loss timescale) roughly
+            # freq_loss ~ k_map * ne (approx). 
+            # We do a quick check to see if we need to account for fast neutral loss.
+            freq_loss_est = np.zeros_like(freq_gen_est)
+            if rxn.neutral_reactants:
+                 # Quick estimate using current ne
+                 # Optimization: if ne_order==1, use ne. Else use ne^order.
+                 if rxn.ne_order == 1:
+                     term_ne_est = ne
+                 else:
+                     term_ne_est = ne ** rxn.ne_order
+                 freq_loss_est = k_map * term_ne_est
+
+            # Find maximum freq across the domain
+            max_freq_gen = np.max(np.where(mask > 0, freq_gen_est, 0.0))
+            max_freq_loss = np.max(np.where(mask > 0, freq_loss_est, 0.0))
+            
+            local_max_freq = max(max_freq_gen, max_freq_loss)
+            
+            # Determine N steps. Target: freq * dt_sub ~ 0.1
+            if local_max_freq > 1e-20:
+                # If dt * freq = 10, we need 100 steps.
+                n_steps = int(math.ceil(dt * local_max_freq / 0.1))
+            else:
+                n_steps = 1
+            
+            # Force at least 1 step
+            if n_steps < 1: n_steps = 1
+            
+            dt_sub = dt / float(n_steps)
+
+            # 3. Sub-cycling Loop
+            for _ in range(n_steps):
+                
+                # --- A. Re-evaluate Density Terms (CRITICAL for Mass Conservation) ---
+                
+                # Electron Term
+                if rxn.ne_order == 0:
+                    term_ne = 1.0
+                elif rxn.ne_order == 1:
+                    term_ne = ne
+                elif rxn.ne_order == 2:
+                    term_ne = ne * ne
+                else:
+                    term_ne = ne ** rxn.ne_order
+
+                # Neutral Term
+                term_nn = 1.0
+                valid_reaction = True
+                
+                # We iterate neutral reactants and pull the *current* grid values
+                for spec, order in rxn.neutral_reactants.items():
+                    # spec is guaranteed in state_map due to precompute check, but we check for safety
+                    idx = state_map[spec]
+                    n_s = neutral_fluid.list_nn_grid[idx]
+                    
+                    if order == 1:
+                        term_nn = term_nn * n_s
+                    else:
+                        term_nn = term_nn * (n_s ** order)
+
+                # Rate [events / m^3 / s]
+                # Note: k_map is FROZEN, but terms are FRESH.
+                R = k_map * term_ne * term_nn
+                
+                events = R * dt_sub
+
+                # --- B. Apply Changes Immediately (In-Place) ---
+                
+                # 1. Electrons
+                if rxn.net_changes_ne != 0:
+                    # Direct update to fluid array
+                    ne += float(rxn.net_changes_ne) * events
+                
+                # 2. Neutrals
+                for spec, change in rxn.net_changes_species.items():
+                    idx = state_map[spec]
+                    neutral_fluid.list_nn_grid[idx] += float(change) * events
+                    
+                    # Safety Clamp: Because we sub-cycle, we track depletion well,
+                    # but fp precision can still cause -1e-20.
+                    # We clamp ONLY the species that changed.
+                    if change < 0:
+                        np.maximum(neutral_fluid.list_nn_grid[idx], 0.0, out=neutral_fluid.list_nn_grid[idx])
+
+                # 3. Energy
+                if rxn.delta_E_eV != 0.0:
+                    dE_J = float(constants.kb * kelvin_from_eV(float(rxn.delta_E_eV)))
+                    
+                    # We update Te immediately. 
+                    # Note: compute_dTe_inelastic usually returns a delta.
+                    # We add it to the main Te grid immediately.
+                    dTe = compute_dTe_inelastic(
+                        mask.astype(np.int8),
+                        ne,
+                        R,
+                        -float(dE_J), 
+                        float(dt_sub), # Use sub-step dt
+                        float(electron_fluid.ne_floor),
+                    )
+                    Te += dTe
+
+        # Finalize Neutral Fluid (Macroscopic moments) after all reactions are done
+        neutral_fluid.compute_nn_grid_from_states()
         neutral_fluid.update_rho()
         neutral_fluid.update_p()
 
+
+    def do_electron_inelastic_collisions_exponential_integrator(
+        self,
+        geom: Geometry,
+        electron_fluid: ElectronFluidContainer,
+        neutral_fluid: NeutralFluidContainer,
+        dt: float,
+        precomputed_data: Dict[str, Dict[str, np.ndarray]],
+        accumulate_ionization: bool = False,
+        accumulate_recombination: bool = False,
+    ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        """
+        Unified generalized inelastic collision loop with ADAPTIVE SUB-CYCLING.
+        Includes PROBABILISTIC (Exponential) correction for depletion stability.
+        
+        Returns:
+            If accumulate_* flags are True, returns (delta_ni_ionization, delta_ni_recombination).
+            Otherwise returns None.
+        """
+        mask = geom.mask.astype(np.int8)
+        
+        # Direct access to mutable arrays
+        ne = electron_fluid.ne_grid
+        Te = electron_fluid.Te_grid
+        
+        # Initialize Accumulators (if requested)
+        # We allocate them regardless to keep logic simple, or check flags to save RAM.
+        # Given this is a heavy loop, let's only allocate if needed.
+        delta_ni_ionization = None
+        delta_ni_recombination = None
+        
+        if accumulate_ionization:
+            delta_ni_ionization = np.zeros_like(ne, dtype=float)
+        if accumulate_recombination:
+            delta_ni_recombination = np.zeros_like(ne, dtype=float)
+        
+        if not hasattr(neutral_fluid, 'str_states_list') or not hasattr(neutral_fluid, 'list_nn_grid'):
+             raise AttributeError("NeutralFluidContainer must have str_states_list and list_nn_grid.")
+
+        state_map = {name: i for i, name in enumerate(neutral_fluid.str_states_list)}
+        
+        relevant_reactions = [
+            r for r in self.reactions.values()
+            if r.rtype in {"IONIZATION", "RECOMBINATION", "EXCITATION"} 
+        ]
+
+        for rxn in relevant_reactions:
+            if rxn.name not in precomputed_data:
+                continue
+            
+            # 1. Retrieve frozen Rate Coefficient
+            data = precomputed_data[rxn.name]
+            k_map = data['k_map']
+            
+            # 2. Estimate Stiffness for N steps
+            freq_gen_est = data['freq'] 
+            freq_loss_est = np.zeros_like(freq_gen_est)
+            
+            if rxn.neutral_reactants:
+                 if rxn.ne_order == 1:
+                     term_ne_est = ne
+                 else:
+                     term_ne_est = ne ** rxn.ne_order
+                 freq_loss_est = k_map * term_ne_est
+
+            local_max_freq = max(
+                np.max(np.where(mask > 0, freq_gen_est, 0.0)),
+                np.max(np.where(mask > 0, freq_loss_est, 0.0))
+            )
+            
+            # Target 0.2 probability per step
+            if local_max_freq > 1e-20:
+                n_steps = int(math.ceil(dt * local_max_freq / 0.2))
+            else:
+                n_steps = 1
+            if n_steps < 1: n_steps = 1
+            
+            dt_sub = dt / float(n_steps)
+
+            # Identify Depletion Species
+            depletion_spec = None
+            depletion_stoich = 0.0
+            
+            for spec in rxn.neutral_reactants:
+                net_change = rxn.net_changes_species.get(spec, 0)
+                if net_change < 0:
+                    depletion_spec = spec
+                    depletion_stoich = abs(net_change)
+                    break 
+
+            # 3. Sub-cycling Loop
+            for _ in range(n_steps):
+                
+                # --- A. Re-evaluate Density Terms ---
+                if rxn.ne_order == 0:   term_ne = 1.0
+                elif rxn.ne_order == 1: term_ne = ne
+                elif rxn.ne_order == 2: term_ne = ne * ne
+                else:                   term_ne = ne ** rxn.ne_order
+
+                term_nn = 1.0
+                depletion_n_grid = None
+                
+                for spec, order in rxn.neutral_reactants.items():
+                    idx = state_map[spec]
+                    n_s = neutral_fluid.list_nn_grid[idx]
+                    
+                    if spec == depletion_spec:
+                        depletion_n_grid = n_s 
+                    
+                    if order == 1: term_nn = term_nn * n_s
+                    else:          term_nn = term_nn * (n_s ** order)
+
+                # Linear Rate [events / m^3 / s]
+                R = k_map * term_ne * term_nn
+                
+                # --- B. Calculate Events (Linear vs Exponential) ---
+                if depletion_spec and depletion_n_grid is not None:
+                    # PROBABILISTIC UPDATE
+                    valid_mask = depletion_n_grid > 1e-30
+                    
+                    freq_loss = np.zeros_like(R)
+                    np.divide(R, depletion_n_grid, out=freq_loss, where=valid_mask)
+                    
+                    decay_rate = freq_loss * depletion_stoich
+                    prob = 1.0 - np.exp(-decay_rate * dt_sub)
+                    
+                    n_consumed = depletion_n_grid * prob
+                    events = n_consumed / depletion_stoich
+                    
+                else:
+                    # Standard Linear Update
+                    events = R * dt_sub
+
+
+                # --- C. Apply Changes Immediately ---
+                
+                # 1. Electrons & Accumulation
+                if rxn.net_changes_ne != 0:
+                    change_ne = float(rxn.net_changes_ne) * events
+                    ne += change_ne
+                    
+                    # --- ACCUMULATION LOGIC ---
+                    if accumulate_ionization and rxn.rtype == "IONIZATION":
+                        # change_ne is positive for ionization
+                        delta_ni_ionization += change_ne
+                    
+                    elif accumulate_recombination and rxn.rtype == "RECOMBINATION":
+                        # change_ne is negative for recombination. 
+                        # We usually want the MAGNITUDE for the particle weigher.
+                        delta_ni_recombination += np.abs(change_ne)
+                
+                # 2. Neutrals
+                for spec, change in rxn.net_changes_species.items():
+                    idx = state_map[spec]
+                    neutral_fluid.list_nn_grid[idx] += float(change) * events
+                    if change < 0:
+                        np.maximum(neutral_fluid.list_nn_grid[idx], 0.0, out=neutral_fluid.list_nn_grid[idx])
+
+                # 3. Energy
+                if rxn.delta_E_eV != 0.0:
+                    dE_J = float(constants.kb * kelvin_from_eV(float(rxn.delta_E_eV)))
+                    R_effective = events / dt_sub
+                    dTe = compute_dTe_inelastic(
+                         mask.astype(np.int8),
+                         ne,
+                         R_effective,
+                         -float(dE_J),
+                         float(dt_sub),
+                         float(electron_fluid.ne_floor)
+                    )
+                    Te += dTe
+
+        # Finalize
+        neutral_fluid.compute_nn_grid_from_states()
+        neutral_fluid.update_rho()
+        neutral_fluid.update_p()
+        
+        # Return accumulators if they exist
+        if delta_ni_ionization is not None or delta_ni_recombination is not None:
+            return delta_ni_ionization, delta_ni_recombination
+        return None
+        
 
     def do_spontaneous_emission(
         self,
