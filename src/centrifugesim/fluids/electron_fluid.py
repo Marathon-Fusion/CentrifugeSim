@@ -16,12 +16,13 @@ class ElectronFluidContainer:
         Move diffusion and advection terms to dolfinx!
         Do advance 
     """
-    def __init__(self, geom:Geometry, ne_floor, Te_floor):
+    def __init__(self, geom:Geometry, ne0, ne_floor, Te_floor):
 
         self.Nr = geom.Nr
         self.Nz = geom.Nz
 
         # floor values
+        self.ne0 = ne0
         self.ne_floor = ne_floor
         self.Te_floor = Te_floor
 
@@ -162,7 +163,7 @@ class ElectronFluidContainer:
         else:
             dt_stable = dt  # no diffusion -> no stability restriction
 
-        Q_Joule_grid = np.where(self.ne_grid<self.ne_floor, 0, Q_Joule_grid)
+        Q_Joule_grid = np.where(self.ne_grid<self.ne0, 0, Q_Joule_grid)
 
         # Helper to perform one advance with a given local dt
         def _advance(dt_local):
