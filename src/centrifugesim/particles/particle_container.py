@@ -666,3 +666,106 @@ class ParticleContainer:
         del Tn_device, nn_device
         del un_r_device, un_t_device, un_z_device
         cp._default_memory_pool.free_all_blocks()
+
+    def inject_cathode_ions(self, geom, hybrid_pic, electron_fluid, neutral_fluid, dt, nppc_inj=5):
+        """
+        Injects new ion macroparticles at the cathode exit plane.
+        """
+        new_r, new_z, new_vr, new_vt, new_vz, weights = self.arrays_inject_cathode_ions(
+            geom, hybrid_pic, electron_fluid, neutral_fluid, dt, nppc_inj)
+        
+        self.add_from_numpy_arrays(geom, weights, new_r, new_z, new_vr, new_vt, new_vz)
+
+    def arrays_inject_cathode_ions(self, geom, hybrid_pic, electron_fluid, neutral_fluid, dt, nppc_inj=5):
+        """
+        Generates new ion macroparticles at the cathode exit plane.
+        """
+        nppc = nppc_inj
+        
+        # 1. Define Indices and Constants
+        # -------------------------------
+        # Number of radial cells/nodes to inject from
+        Nr_inj = int(geom.rmax_cathode / geom.dr) + 1
+        Nz_inj = int(geom.zmax_cathode / geom.dz) + 1
+            
+        # 2. Extract Local Plasma Parameters at Injection Surface
+        # -----------------------------------------------------
+        # Slice the grids to get properties at the cathode face
+        # Note: We assume the Flux array provided by you matches this slice size
+        Te_local = electron_fluid.Te_grid[:Nr_inj, Nz_inj]
+        Tn_local = neutral_fluid.T_n_grid[:Nr_inj, Nz_inj]
+        
+        # Calculate Drift Velocity (Bohm Speed) +z direction
+        # v_drift = sqrt(k_b * Te / M_i)
+        vz_drift_local = np.sqrt((constants.kb * Te_local) / self.m)
+        
+        # Calculate Thermal Spread (based on Neutral Temp)
+        # v_th = sqrt(k_b * Tn / M_i)
+        v_th_local = np.sqrt((constants.kb * Tn_local) / self.m)
+        
+        # 3. Calculate Flux and Weights
+        # -----------------------------
+        # Your provided flux calculation:
+        flux_z_ions = np.abs(hybrid_pic.Jz_cathode_top_vec[:Nr_inj] / (self.Z * constants.q_e) * np.sqrt(constants.m_e / self.m))
+        
+        # Calculate the Area of each radial annulus
+        # Assuming the grid is r[j] = j*dr. 
+        # Area_j = pi * (r_outer^2 - r_inner^2)
+        # We treat the node 'j' as the center or left edge of an injection ring. 
+        # Let's assume cell-centered injection for volume consistency:
+        r_nodes = np.arange(Nr_inj) * geom.dr
+        r_inner = r_nodes
+        r_outer = r_nodes + geom.dr
+        area_annulus = np.pi * (r_outer**2 - r_inner**2)
+        
+        # Calculate Number of Real Ions per cell
+        N_real_per_cell = flux_z_ions * area_annulus * dt
+        
+        # Calculate Weight per Macroparticle
+        # w = Total Real Ions / Total Macroparticles
+        weight_per_cell = N_real_per_cell / nppc
+
+        # 4. Create Particle Arrays (Vectorized)
+        # --------------------------------------
+        # We repeat the local cell properties 'nppc' times to create the particle lists
+        
+        # Repeat parameters for each particle
+        vz_drift_p = np.repeat(vz_drift_local, nppc)
+        v_th_p     = np.repeat(v_th_local, nppc)
+        weights_p  = np.repeat(weight_per_cell, nppc)
+        
+        # Repeat geometric bounds for position sampling
+        r_inner_p  = np.repeat(r_inner, nppc)
+        r_outer_p  = np.repeat(r_outer, nppc)
+        
+        # Total number of new particles
+        N_new = len(weights_p)
+
+        # 5. Sample Velocities (Shifted Maxwellian)
+        # -----------------------------------------
+        # vr, vt: Centered Maxwellian
+        new_vr = np.random.normal(0.0, v_th_p, N_new)
+        new_vt = np.random.normal(0.0, v_th_p, N_new)
+        
+        # vz: Shifted Maxwellian (Drift + Thermal)
+        # Note: Since drift >> thermal usually, we don't strictly need half-Maxwellian rejection
+        new_vz = np.random.normal(vz_drift_p, v_th_p, N_new)
+        
+        # Sanity check: Ensure no particles go backwards (-z) into cathode
+        # If v_drift is small, this might happen. Clip to 0 or re-sample.
+        new_vz = np.maximum(new_vz, 0.0)
+
+        # 6. Sample Positions
+        # -------------------
+        # Z: Fixed at cathode exit plane (or slightly jittered by v*dt/2)
+        z_cathode_exit = geom.zmax_cathode # or geom.dz * Nz_inj
+        new_z = np.full(N_new, z_cathode_exit)
+
+        new_z += new_vz * dt/2  # half advance to avoid immediate re-absorption
+        
+        # R: Uniform Area Sampling
+        # To distribute uniformly in an annulus, we sample r^2 uniformly
+        u_rand = np.random.random(N_new)
+        new_r = np.sqrt(u_rand * (r_outer_p**2 - r_inner_p**2) + r_inner_p**2)
+
+        return new_r, new_z, new_vr, new_vt, new_vz, weights_p
