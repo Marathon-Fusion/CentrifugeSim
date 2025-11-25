@@ -89,7 +89,7 @@ def electron_conductivities(
 
 # Update solver !
 @numba.jit(nopython=True, parallel=True, nogil=True)
-def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
+def solve_step_prev(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
                br, bz, kappa_parallel, kappa_perp,
                Jer, Jez,
                mask, dt):
@@ -291,4 +291,205 @@ def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
             #rhs = -div_q - div_Fadv + Q_Joule[i, j]
             rhs = -div_q + Q_Joule[i, j]
             dTe_dt = (2.0 / (3.0 * n_e[i, j] * kb)) * rhs
+            Te_new[i, j] = Te[i, j] + dt * dTe_dt
+
+
+@numba.jit(nopython=True, parallel=True, nogil=True)
+def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
+               br, bz, kappa_parallel, kappa_perp,
+               Jer, Jez,
+               mask, dt):
+    """
+    Advances electron temperature with Anisotropic Conduction + Boundary Convection.
+    
+    Includes 'Enthalpy Flux' cooling at electrodes (Anode/Cathode) to prevent
+    overheating in the sheath.
+    """
+    NR, NZ = Te.shape
+    kb = constants.kb
+    qe = constants.q_e
+
+    # Enthalpy coefficient: 2.5 * kB / e
+    # Flux Q = 2.5 * kB * T * Gamma_e = 2.5 * kB * T * (Je / -e)
+    # Q = - (2.5 * kB/e) * T * Je
+    alpha = 2.5 * kb / qe
+    
+    # Assume wall emission temperature (approx 1-2 eV) for inflow
+    T_wall_K = 2000.0 
+
+    for i in numba.prange(1, NR - 1):
+        for j in range(1, NZ - 1):
+
+            # Skip solid/vacuum cells
+            if not (mask[i, j] == 1 and n_e[i, j] > 0.0):
+                continue
+
+            # =========================
+            # 1. Radial Fluxes (qr)
+            # =========================
+
+            # --- Right face (i+1/2, j) ---
+            qr_rh = 0.0
+            
+            # A. Internal Conduction (Plasma to Plasma)
+            if i < NR - 1 and mask[i+1, j] == 1:
+                # Only conduct if 4-point stencil is valid (simplified check)
+                # You can relax this to 2-point if needed, but keeping your original logic:
+                if (mask[i, j+1] and mask[i, j-1] and mask[i+1, j+1] and mask[i+1, j-1]):
+                    
+                    br_rh = 0.5 * (br[i, j] + br[i+1, j])
+                    bz_rh = 0.5 * (bz[i, j] + bz[i+1, j])
+                    k_par = 0.5 * (kappa_parallel[i, j] + kappa_parallel[i+1, j])
+                    k_per = 0.5 * (kappa_perp[i, j] + kappa_perp[i+1, j])
+                    
+                    k_rr = k_per + (k_par - k_per) * br_rh * br_rh
+                    k_rz = (k_par - k_per) * br_rh * bz_rh
+                    
+                    dT_dr = (Te[i+1, j] - Te[i, j]) / dr
+                    dT_dz = (Te[i, j+1] - Te[i, j-1] + Te[i+1, j+1] - Te[i+1, j-1]) / (4.0 * dz)
+                    
+                    qr_rh = -(k_rr * dT_dr + k_rz * dT_dz)
+            
+            # B. Boundary Convection (Plasma to Wall)
+            elif i < NR - 1 and mask[i+1, j] == 0:
+                # We are at the Right edge of plasma. Wall is at i+1.
+                # Normal vector n = +r.
+                
+                J_face = Jer[i, j] # Use cell center approximation for boundary face
+                
+                # Logic:
+                # If Jer < 0: Electrons moving Right (+r). Outflow to wall. COOLING.
+                # If Jer > 0: Electrons moving Left (-r). Inflow from wall. HEATING.
+                
+                if J_face < 0.0:
+                    T_flux = Te[i, j]   # Carry bulk heat out
+                else:
+                    T_flux = T_wall_K   # Bring cold electrons in
+                
+                qr_rh = -alpha * T_flux * J_face
+
+            # --- Left face (i-1/2, j) ---
+            qr_lh = 0.0
+            
+            # A. Internal Conduction
+            if i > 1 and mask[i-1, j] == 1:
+                if (mask[i, j+1] and mask[i, j-1] and mask[i-1, j+1] and mask[i-1, j-1]):
+                    
+                    br_lh = 0.5 * (br[i, j] + br[i-1, j])
+                    bz_lh = 0.5 * (bz[i, j] + bz[i-1, j])
+                    k_par = 0.5 * (kappa_parallel[i, j] + kappa_parallel[i-1, j])
+                    k_per = 0.5 * (kappa_perp[i, j] + kappa_perp[i-1, j])
+                    
+                    k_rr = k_per + (k_par - k_per) * br_lh * br_lh
+                    k_rz = (k_par - k_per) * br_lh * bz_lh
+                    
+                    dT_dr = (Te[i, j] - Te[i-1, j]) / dr
+                    dT_dz = (Te[i, j+1] - Te[i, j-1] + Te[i-1, j+1] - Te[i-1, j-1]) / (4.0 * dz)
+                    
+                    qr_lh = -(k_rr * dT_dr + k_rz * dT_dz)
+            
+            # B. Boundary Convection (Plasma to Wall)
+            elif i > 0 and mask[i-1, j] == 0:
+                # We are at Left edge of plasma. Wall is at i-1.
+                # Normal vector is -r (looking from wall)? 
+                # No, qr_lh is flux across i-1/2 in +r direction.
+                
+                J_face = Jer[i, j]
+                
+                # Logic for qr_lh (Flux across left face in +r direction):
+                # If Jer > 0: Electrons moving Left (-r) (Out of plasma into Left Wall).
+                #    This is Outflow. We lose heat. Flux must be Negative (Leaving i).
+                #    Formula: -alpha * T * (+J) = Negative. Correct.
+                
+                if J_face > 0.0:
+                    T_flux = Te[i, j] # Outflow to left wall
+                else:
+                    T_flux = T_wall_K # Inflow from left wall
+                
+                qr_lh = -alpha * T_flux * J_face
+
+
+            # =========================
+            # 2. Axial Fluxes (qz)
+            # =========================
+
+            # --- Top face (i, j+1/2) ---
+            qz_th = 0.0
+            
+            if j < NZ - 1 and mask[i, j+1] == 1:
+                # Internal Conduction
+                if (mask[i+1, j] and mask[i-1, j] and mask[i+1, j+1] and mask[i-1, j+1]):
+                    bz_th = 0.5 * (bz[i, j] + bz[i, j+1])
+                    br_th = 0.5 * (br[i, j] + br[i, j+1])
+                    k_par = 0.5 * (kappa_parallel[i, j] + kappa_parallel[i, j+1])
+                    k_per = 0.5 * (kappa_perp[i, j] + kappa_perp[i, j+1])
+                    
+                    k_zz = k_per + (k_par - k_per) * bz_th * bz_th
+                    k_rz = (k_par - k_per) * br_th * bz_th
+                    
+                    dT_dz = (Te[i, j+1] - Te[i, j]) / dz
+                    dT_dr = (Te[i+1, j] - Te[i-1, j] + Te[i+1, j+1] - Te[i-1, j+1]) / (4.0 * dr)
+                    
+                    qz_th = -(k_rz * dT_dr + k_zz * dT_dz)
+            
+            elif j < NZ - 1 and mask[i, j+1] == 0:
+                # Boundary Top
+                J_face = Jez[i, j]
+                # If J < 0: Electrons moving Up (+z). Outflow.
+                if J_face < 0.0:
+                    T_flux = Te[i, j]
+                else:
+                    T_flux = T_wall_K
+                qz_th = -alpha * T_flux * J_face
+
+            # --- Bottom face (i, j-1/2) ---
+            qz_bh = 0.0
+            
+            if j > 1 and mask[i, j-1] == 1:
+                # Internal Conduction
+                if (mask[i+1, j] and mask[i-1, j] and mask[i+1, j-1] and mask[i-1, j-1]):
+                    bz_bh = 0.5 * (bz[i, j] + bz[i, j-1])
+                    br_bh = 0.5 * (br[i, j] + br[i, j-1])
+                    k_par = 0.5 * (kappa_parallel[i, j] + kappa_parallel[i, j-1])
+                    k_per = 0.5 * (kappa_perp[i, j] + kappa_perp[i, j-1])
+                    
+                    k_zz = k_per + (k_par - k_per) * bz_bh * bz_bh
+                    k_rz = (k_par - k_per) * br_bh * bz_bh
+                    
+                    dT_dz = (Te[i, j] - Te[i, j-1]) / dz
+                    dT_dr = (Te[i+1, j] - Te[i-1, j] + Te[i+1, j-1] - Te[i-1, j-1]) / (4.0 * dr)
+                    
+                    qz_bh = -(k_rz * dT_dr + k_zz * dT_dz)
+            
+            elif j > 0 and mask[i, j-1] == 0:
+                # Boundary Bottom (e.g., Cathode Face)
+                J_face = Jez[i, j]
+                # If J > 0: Electrons moving Down (-z). Outflow.
+                # If J < 0: Electrons moving Up (+z). Inflow (from Cathode).
+                
+                if J_face > 0.0:
+                    T_flux = Te[i, j]   # Outflow
+                else:
+                    T_flux = T_wall_K   # Inflow (Cathode Emission is cold relative to bulk)
+                
+                qz_bh = -alpha * T_flux * J_face
+
+            # =========================
+            # 3. Divergence & Update
+            # =========================
+            
+            # RZ Divergence: (1/r) * d(r*qr)/dr
+            r_c = r_vec[i] + 1e-12
+            r_r = r_vec[i] + 0.5 * dr
+            r_l = r_vec[i] - 0.5 * dr
+
+            div_q = ((r_r * qr_rh - r_l * qr_lh) / (r_c * dr) + 
+                     (qz_th - qz_bh) / dz)
+           
+            rhs = -div_q + Q_Joule[i, j]
+            
+            # Update
+            # dTe/dt = (2/3n) * RHS
+            dTe_dt = (2.0 / (3.0 * n_e[i, j] * kb)) * rhs
+            
             Te_new[i, j] = Te[i, j] + dt * dTe_dt
