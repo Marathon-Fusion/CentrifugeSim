@@ -81,7 +81,7 @@ class HybridPICModel:
         self.Bz_grid_d = cp.asarray(self.Bz_grid)
 
 
-    def compute_dphi_dz_cathode(self, geom:Geometry, I, electron_fluid, rmax_injection=None, sigma_r=None):
+    def compute_dphi_dz_cathode(self, geom:Geometry, I, electron_fluid, Jiz_grid=None, rmax_injection=None, sigma_r=None):
         # I is negative (enters cathode)
 
         # Should be input instead
@@ -94,18 +94,25 @@ class HybridPICModel:
         i_cathode = (np.arange(self.Nr)[geom.r <= rmax_injection]).astype(np.int32)
         j_cathode = ((int(geom.zmax_cathode/geom.dz)+1)*np.ones_like(i_cathode)).astype(np.int32)
 
-        # calculate input current density (Jz0 is negative)
+        # calculate input current density (I is negative)
         Jz0 = I / (2*np.pi*sigma_r**2)
         Jz_cathode = Jz0*np.exp(-0.5*geom.r[i_cathode]**2 / sigma_r**2)
 
         sigma_parallel_cathode = electron_fluid.sigma_parallel_grid[i_cathode, j_cathode]
-        dpe_dz_cathode = (electron_fluid.pe_grid[i_cathode, j_cathode+1] - electron_fluid.pe_grid[i_cathode, j_cathode])/geom.dz
-
+        
         # dphi_dz = (Jiz-Jz)/sigma_parallel + dpe/dz /(e*ne) at cathode
         dphi_dz_vec_aux = -Jz_cathode/sigma_parallel_cathode
-        #dphi_dz_vec_aux = -Jz_cathode/sigma_parallel_cathode + dpe_dz_cathode/(constants.q_e*electron_fluid.ne_grid[i_cathode, j_cathode])
+    
+        if(Jiz_grid is not None):
+            Jiz_cathode = Jiz_grid[i_cathode, j_cathode]
+            dphi_dz_vec_aux += Jiz_cathode/sigma_parallel_cathode
 
-        dphi_dz_vec[i_cathode] = - dphi_dz_vec_aux # flipping sign here due to how the solver was written
+        #dpe_dz_cathode = (electron_fluid.pe_grid[i_cathode, j_cathode+1] - electron_fluid.pe_grid[i_cathode, j_cathode])/geom.dz
+        #ne_cathode = electron_fluid.ne_grid[i_cathode, j_cathode]
+        #dphi_dz_vec_aux += dpe_dz_cathode/(constants.q_e*ne_cathode)
+        
+        # flipping sign here due to how the solver was written
+        dphi_dz_vec[i_cathode] = - dphi_dz_vec_aux 
 
         self.dphi_dz_cathode_top_vec = np.copy(dphi_dz_vec)
         self.Jz_cathode_top_vec[i_cathode] = np.copy(Jz_cathode)
@@ -139,25 +146,28 @@ class HybridPICModel:
             verbose=verbose
         )
 
-        Er, Ez, Jer, Jez = compute_E_and_J(phi, geom,
-                    electron_fluid.sigma_P_grid,
-                    electron_fluid.sigma_parallel_grid,
-                    ne=electron_fluid.ne_grid,
-                    pe=electron_fluid.pe_grid,
-                    Bz=self.Bz_grid,
-                    un_theta=neutral_fluid.un_theta_grid,
-                    ne_floor=electron_fluid.ne_floor,
-                    fill_solid_with_nan=False)
+        Er, Ez, Jer, Jez, Er_gradpe, Ez_gradpe = compute_E_and_J(phi, geom,
+                            electron_fluid.sigma_P_grid,
+                            electron_fluid.sigma_parallel_grid,
+                            ne=electron_fluid.ne_grid,
+                            pe=electron_fluid.pe_grid,
+                            Bz=self.Bz_grid,
+                            un_theta=neutral_fluid.un_theta_grid,
+                            ne_floor=electron_fluid.ne_floor,
+                            fill_solid_with_nan=False)
 
         # TO DO: move to kernel
         q_ohm = electron_fluid.sigma_P_grid*Er*Er + electron_fluid.sigma_parallel_grid*Ez*Ez
 
         self.phi_grid = np.copy(phi)
-        self.Er_grid = np.copy(Er)
-        self.Ez_grid = np.copy(Ez)
+        self.Er_grid = np.copy(Er+Er_gradpe)
+        self.Ez_grid = np.copy(Ez+Ez_gradpe)
         self.Jer_grid = np.copy(Jer)
         self.Jez_grid = np.copy(Jez)
         self.q_ohm_grid = np.copy(q_ohm)
+
+        self.Er_grid_d = cp.asarray(self.Er_grid)
+        self.Ez_grid_d = cp.asarray(self.Ez_grid)
 
         del phi, Er, Ez, Jer, Jez, q_ohm
 

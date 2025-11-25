@@ -77,7 +77,7 @@ class NeutralFluidContainer:
         self.rho_grid[self.fluid==1] = self.mass*self.nn_grid[self.fluid==1]
 
     def update_nn(self):
-        self.nn_grid[self.fluid==1] = self.rho[self.fluid==1]/self.mass
+        self.nn_grid[self.fluid==1] = self.rho_grid[self.fluid==1]/self.mass
 
     def update_p(self):
         self.p_grid[self.fluid==1] = self.rho_grid[self.fluid==1] * self.Rgas_over_m * self.T_n_grid[self.fluid==1]
@@ -90,7 +90,7 @@ class NeutralFluidContainer:
                                     nu_in, Ti, dt):
 
         dtnu_max = nu_in[geom.mask==1].max()*dt
-        if(round(dtnu_max,3)>0.1):
+        if(round(dtnu_max,2)>0.1):
             print("dt*nu_in.max() > 0.1 !", dtnu_max)
 
         un_r_new, un_t_new, un_z_new, Tn_new = neutral_fluid_helper.update_u_in_collisions(

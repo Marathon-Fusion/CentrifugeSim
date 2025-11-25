@@ -20,6 +20,8 @@ def _compute_EJ_core(phi, mask, r, z,
     Ez  = np.zeros((Nr, Nz), dtype=phi.dtype)
     Jr  = np.zeros((Nr, Nz), dtype=phi.dtype)
     Jz  = np.zeros((Nr, Nz), dtype=phi.dtype)
+    Er_gradpe = np.zeros((Nr, Nz), dtype=phi.dtype)
+    Ez_gradpe = np.zeros((Nr, Nz), dtype=phi.dtype)
 
     EPS = 1e-30
 
@@ -164,6 +166,8 @@ def _compute_EJ_core(phi, mask, r, z,
                 inv_e_ne = 1.0 / (echarge * n_e)
                 jr += sigP   * (inv_e_ne * dpdr)*0
                 jz += sigPar * (inv_e_ne * dpdz)*0
+                Er_gradpe[i, j] += -(inv_e_ne * dpdr)
+                Ez_gradpe[i, j] += -(inv_e_ne * dpdz)
 
             if use_rot:
                 jr += sigP * (Bz[i, j] * un_theta[i, j])
@@ -175,7 +179,7 @@ def _compute_EJ_core(phi, mask, r, z,
             Jr[i, j] = jr
             Jz[i, j] = jz
 
-    return Er, Ez, Jr, Jz
+    return Er, Ez, Jr, Jz, Er_gradpe, Ez_gradpe
 
 
 def compute_E_and_J(phi, geom,
@@ -214,13 +218,13 @@ def compute_E_and_J(phi, geom,
 
     echarge = constants.q_e
 
-    Er, Ez, Jr, Jz = _compute_EJ_core(phi, mask, r, z,
+    Er, Ez, Jr, Jz, Er_gradpe, Ez_gradpe = _compute_EJ_core(phi, mask, r, z,
                                       sigma_P, sigma_par,
                                       ne_arr, pe_arr, Bz_arr, utheta_arr, Ji_r_arr, Ji_z_arr,
                                       float(ne_floor), float(echarge),
                                       use_pe, use_rot, use_ji,
                                       fill_solid_with_nan)
-    return Er, Ez, Jr, Jz
+    return Er, Ez, Jr, Jz, Er_gradpe, Ez_gradpe
 
 
 @njit(parallel=True, fastmath=True, cache=True)
