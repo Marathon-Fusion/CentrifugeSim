@@ -44,11 +44,28 @@ class ElectronFluidContainer:
         self.kappa_parallel_grid = np.zeros((geom.Nr,geom.Nz)).astype(np.float64)
         self.kappa_perp_grid = np.zeros((geom.Nr,geom.Nz)).astype(np.float64)
 
-        self.beta_e_grid = np.zeros((geom.Nr,geom.Nz)).astype(np.float64) 
+        self.beta_e_grid = np.zeros((geom.Nr,geom.Nz)).astype(np.float64)
+
+        # electron drift velocity components (for particle pusher)
+        self.uer_grid = np.zeros((self.Nr, self.Nz)).astype(np.float64)
+        self.uet_grid = np.zeros((self.Nr, self.Nz)).astype(np.float64)
+        self.uez_grid = np.zeros((self.Nr, self.Nz)).astype(np.float64)
+
+    def update_drift_velocities(self, hybrid_pic):
+        """
+        Update electron drift velocities from current densities and ne:
+            u_e = J_e / ( -e * n_e )
+        """
+        qe = constants.q_e  # electron charge (C)
+
+        ne_eff = np.maximum(self.ne_grid, self.ne_floor)  # m^-3 (avoid div-by-zero)
+
+        self.uer_grid[:, :] = hybrid_pic.Jer_grid / (-qe * ne_eff)
+        #self.uet_grid[:, :] = hybrid_pic.Jet_grid / (-qe * ne_eff)
+        self.uez_grid[:, :] = hybrid_pic.Jez_grid / (-qe * ne_eff)
 
     def update_pressure(self):
         self.pe_grid = constants.kb*self.Te_grid*self.ne_grid
-
 
     def set_kappa(self, hybrid_pic):
         """

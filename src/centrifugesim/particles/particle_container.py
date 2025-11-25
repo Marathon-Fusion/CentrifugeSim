@@ -163,20 +163,20 @@ class ParticleContainer:
                 self.z[ind_zmax] -= L
 
         # check if particles are asorbed at cathode:
-        ind_cathode = cp.flatnonzero(cp.logical_and(self.r<=geom.rmax_cathode,self.z<=geom.zmax_cathode))
+        ind_cathode = cp.flatnonzero(cp.logical_and(self.r<geom.rmax_cathode,self.z<geom.zmax_cathode))
         if(ind_cathode.shape[0]>0):
             self.remove_indices_and_free_memory(ind_cathode)
 
         # check if particles are absorbed at first anode:
-        ind_anode_1 = cp.flatnonzero(cp.logical_and(self.r>=geom.rmin_anode,
-                        cp.logical_and(self.z>=geom.zmin_anode,self.z<=geom.zmax_anode)))
+        ind_anode_1 = cp.flatnonzero(cp.logical_and(self.r>geom.rmin_anode,
+                        cp.logical_and(self.z>geom.zmin_anode,self.z<geom.zmax_anode)))
         if(ind_anode_1.shape[0]>0):
             self.remove_indices_and_free_memory(ind_anode_1)
 
         # check if particles are absorbed at second anode:
         dz_anode = geom.zmax_anode - geom.zmin_anode
-        ind_anode_2 = cp.flatnonzero(cp.logical_and(self.r>=geom.rmin_anode,
-                        cp.logical_and(self.z>=geom.zmin_anode2,self.z<=geom.zmax_anode2)))
+        ind_anode_2 = cp.flatnonzero(cp.logical_and(self.r>geom.rmin_anode,
+                        cp.logical_and(self.z>geom.zmin_anode2,self.z<geom.zmax_anode2)))
         if(ind_anode_2.shape[0]>0):
             self.remove_indices_and_free_memory(ind_anode_2)
 
@@ -260,7 +260,7 @@ class ParticleContainer:
     def depositNandJ(self, geom):
         Nr, Nz = geom.Nr, geom.Nz
         dr, dz, zmin = geom.dr, geom.dz, geom.zmin
-        volume_field = geom.volume_field
+        volume_field = geom.volume_field_dep
 
         volume_field_d = cp.asarray(volume_field)
 
@@ -416,15 +416,22 @@ class ParticleContainer:
                        zmin,
                        dt):
         """
-        Uer, Uet, Uez, ne, Te and nu_ei should already be float32 device arrays (Nr, Nz)
+        Uer, Uet, Uez, ne, Te and nu_ei are host arrays here (Nr, Nz)
         """
+        Uer_d = cp.asarray(Uer).astype(cp.float32)
+        Uet_d = cp.asarray(Uet).astype(cp.float32)
+        Uez_d = cp.asarray(Uez).astype(cp.float32)
+        ne_d = cp.asarray(ne).astype(cp.float32)
+        Te_d = cp.asarray(Te).astype(cp.float32)
+        nu_ei_d = cp.asarray(nu_ei).astype(cp.float32)
+
         # Gather each field to ions positions
-        ne_p =  self.gatherScalarField(ne.astype(cp.float32), dr, dz, zmin)
-        Te_p =  self.gatherScalarField(Te.astype(cp.float32), dr, dz, zmin)
-        nu_ei_p =  self.gatherScalarField(nu_ei.astype(cp.float32), dr, dz, zmin)
-        uer_p =  self.gatherScalarField(Uer.astype(cp.float32), dr, dz, zmin)
-        uet_p =  self.gatherScalarField(Uet.astype(cp.float32), dr, dz, zmin)
-        uez_p =  self.gatherScalarField(Uez.astype(cp.float32), dr, dz, zmin)
+        ne_p =  self.gatherScalarField(ne_d, dr, dz, zmin)
+        Te_p =  self.gatherScalarField(Te_d, dr, dz, zmin)
+        nu_ei_p =  self.gatherScalarField(nu_ei_d, dr, dz, zmin)
+        uer_p =  self.gatherScalarField(Uer_d, dr, dz, zmin)
+        uet_p =  self.gatherScalarField(Uet_d, dr, dz, zmin)
+        uez_p =  self.gatherScalarField(Uez_d, dr, dz, zmin)
 
         ind = cp.flatnonzero(ne_p>n_floor)
 

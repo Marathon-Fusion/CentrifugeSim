@@ -47,9 +47,6 @@ class Geometry:
         self.z = np.linspace(self.zmin, self.zmax, self.Nz, dtype=np.float64)
         self.R, self.Z = np.meshgrid(self.r, self.z, indexing='ij')
 
-        # Volume weights
-        self.volume_field = self.compute_volume_field()
-
         # Anode (bool mask)
         self.rmin_anode = float(rmin_anode)
         self.rmax_anode = self.rmax
@@ -90,6 +87,12 @@ class Geometry:
         # Cathode and anode temperatures
         self.temperature_cathode = temperature_cathode
         self.temperature_anode = temperature_anode
+
+        # Volume weights
+        self.volume_field = self.compute_volume_field()
+
+        # Volume weights for particle deposition
+        self.volume_field_dep = self.compute_volume_field_dep()
 
         # Coils store (outside-domain only)
         self.coils: Dict[str, Dict[str, float]] = {}
@@ -214,6 +217,180 @@ class Geometry:
         volume_r[Nr - 1] = np.pi * ((Nr - 1) - 1.0 / 3.0) * dr * dr * dz
 
         return np.repeat(volume_r[:, None], Nz, axis=1)
+
+    def compute_volume_field_dep(self) -> np.ndarray:
+        """
+        Computes the 'Effective Weighted Volume' for particle deposition.
+        
+        This version performs EXACT sub-grid integration. It clips the 
+        control volume of each node against the geometric obstacles 
+        (Cathode, Anode) to ensure that the normalization volume exactly 
+        matches the accessible volume for particles.
+        
+        This fixes the density drop at boundaries where the mesh does not 
+        perfectly align with the object geometry.
+        
+        Returns
+        -------
+        vol_dep : np.ndarray (Nr, Nz)
+        """
+        Nr, Nz = self.Nr, self.Nz
+        dr, dz = self.dr, self.dz
+        r_nodes = self.r
+        z_nodes = self.z
+        
+        vol_dep = np.zeros((Nr, Nz), dtype=np.float64)
+
+        # --- 1. Define Obstacles as Rectangles [r1, r2, z1, z2] ---
+        # We will subtract these from the control volumes.
+        obstacles = []
+        
+        # Cathode (Bottom-Left)
+        obstacles.append([0.0, self.rmax_cathode, 0.0, self.zmax_cathode])
+        
+        # Anode 1 (Ring)
+        obstacles.append([self.rmin_anode, 1e9, self.zmin_anode, self.zmax_anode])
+        
+        # Anode 2 (Ring)
+        obstacles.append([self.rmin_anode, 1e9, self.zmin_anode2, self.zmax_anode2])
+
+        # --- 2. Integration Helpers ---
+        
+        def integrate_weight_r(r_a, r_b, r_node, is_inner):
+            """
+            Integrates W(r) * 2*pi*r dr from r_a to r_b.
+            W(r) is the linear shape function for 'r_node'.
+            is_inner=True  => interval [r_node-dr, r_node]
+            is_inner=False => interval [r_node, r_node+dr]
+            """
+            if r_a >= r_b: return 0.0
+            
+            # Constants for polynomial integration
+            # Inner: W(r) = (r - (rn-dr))/dr = (1 - rn/dr) + r/dr
+            # Outer: W(r) = ((rn+dr) - r)/dr = (1 + rn/dr) - r/dr
+            
+            # Int (A + B*r) * r dr = A*r^2/2 + B*r^3/3
+            
+            if is_inner:
+                A = -(r_node - dr)/dr
+                B = 1.0/dr
+            else:
+                A = (r_node + dr)/dr
+                B = -1.0/dr
+            
+            val_b = 2.0 * np.pi * (A * r_b**2 / 2.0 + B * r_b**3 / 3.0)
+            val_a = 2.0 * np.pi * (A * r_a**2 / 2.0 + B * r_a**3 / 3.0)
+            
+            return val_b - val_a
+
+        def integrate_weight_z(z_a, z_b, z_node, is_lower):
+            """
+            Integrates W(z) dz from z_a to z_b.
+            Linear weighting in Z (flat geometry).
+            """
+            if z_a >= z_b: return 0.0
+            
+            # Inner (Lower): W(z) = (z - (zn-dz))/dz
+            # Outer (Upper): W(z) = ((zn+dz) - z)/dz
+            
+            if is_lower:
+                # Integral of (z - (zn-dz))/dz
+                # = [ z^2/2 - z*(zn-dz) ] / dz
+                def indef(z): return (0.5*z**2 - z*(z_node - dz)) / dz
+                return indef(z_b) - indef(z_a)
+            else:
+                # Integral of ((zn+dz) - z)/dz
+                # = [ z*(zn+dz) - z^2/2 ] / dz
+                def indef(z): return (z*(z_node + dz) - 0.5*z**2) / dz
+                return indef(z_b) - indef(z_a)
+
+        def subtract_rects(rects_list, obstacle):
+            """
+            Subtracts obstacle [or1, or2, oz1, oz2] from a list of valid rects.
+            Returns new list of valid rects.
+            """
+            or1, or2, oz1, oz2 = obstacle
+            new_list = []
+            for r1, r2, z1, z2 in rects_list:
+                # Intersection
+                ir1, ir2 = max(r1, or1), min(r2, or2)
+                iz1, iz2 = max(z1, oz1), min(z2, oz2)
+                
+                if ir1 >= ir2 or iz1 >= iz2:
+                    # No intersection, keep original
+                    new_list.append([r1, r2, z1, z2])
+                else:
+                    # Overlap exists. Breakdown the original rect into remaining pieces.
+                    # 1. Left of intersection
+                    if r1 < ir1: new_list.append([r1, ir1, z1, z2])
+                    # 2. Right of intersection
+                    if ir2 < r2: new_list.append([ir2, r2, z1, z2])
+                    # 3. Below intersection (bounded by intersection R width)
+                    if z1 < iz1: new_list.append([ir1, ir2, z1, iz1])
+                    # 4. Above intersection
+                    if iz2 < z2: new_list.append([ir1, ir2, iz2, z2])
+            return new_list
+
+        # --- 3. Main Loop over Nodes ---
+        for i in range(Nr):
+            rn = r_nodes[i]
+            for j in range(Nz):
+                zn = z_nodes[j]
+                
+                # Skip if node itself is inside solid (no particles here)
+                if self.mask[i, j] == 0:
+                    vol_dep[i, j] = 1.0 
+                    continue
+                
+                total_vol = 0.0
+                
+                # Loop over 4 quadrants around the node
+                # Quad 0: SW (Inner R, Lower Z)
+                # Quad 1: SE (Outer R, Lower Z)
+                # Quad 2: NW (Inner R, Upper Z)
+                # Quad 3: NE (Outer R, Upper Z)
+                
+                quad_configs = [
+                    # (dr_sign, dz_sign, is_inner_r, is_lower_z)
+                    (-0.5, -0.5, True,  True),  # SW
+                    ( 0.5, -0.5, False, True),  # SE
+                    (-0.5,  0.5, True,  False), # NW
+                    ( 0.5,  0.5, False, False)  # NE
+                ]
+                
+                for dr_s, dz_s, is_inner_r, is_lower_z in quad_configs:
+                    # Define Quadrant Bounds
+                    # Be careful with boundaries at edges of domain
+                    if (is_inner_r and i == 0) or (not is_inner_r and i == Nr-1): continue
+                    if (is_lower_z and j == 0) or (not is_lower_z and j == Nz-1): continue
+                    
+                    q_r1 = min(rn, rn + dr_s * dr * 2.0) # *2 because dr_s is 0.5
+                    q_r2 = max(rn, rn + dr_s * dr * 2.0)
+                    q_z1 = min(zn, zn + dz_s * dz * 2.0)
+                    q_z2 = max(zn, zn + dz_s * dz * 2.0)
+                    
+                    # Valid Rectangles List (starts with full quadrant)
+                    valid_rects = [[q_r1, q_r2, q_z1, q_z2]]
+                    
+                    # Subtract all obstacles
+                    for obs in obstacles:
+                        valid_rects = subtract_rects(valid_rects, obs)
+                    
+                    # Integrate volume over remaining valid rects
+                    for vr1, vr2, vz1, vz2 in valid_rects:
+                        vol_r = integrate_weight_r(vr1, vr2, rn, is_inner_r)
+                        vol_z = integrate_weight_z(vz1, vz2, zn, is_lower_z)
+                        total_vol += vol_r * vol_z
+                
+                # Fallback for safety
+                if total_vol < 1e-20:
+                    # Should only happen if mask logic failed or floating point exact match
+                    # Use standard volume to avoid NaN
+                    total_vol = self.volume_field[i, j]
+                    
+                vol_dep[i, j] = total_vol
+
+        return vol_dep
 
     def find_boundary_nodes(self):
         """
