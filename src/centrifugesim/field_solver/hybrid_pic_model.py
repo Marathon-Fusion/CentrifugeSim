@@ -35,6 +35,9 @@ class HybridPICModel:
         self.Et_grid = np.zeros((self.Nr, self.Nz)).astype(np.float64)  # unused in solver; kept for pusher
         self.Ez_grid = np.zeros((self.Nr, self.Nz)).astype(np.float64)
 
+        self.Er_grid_grad_pe = np.zeros((self.Nr, self.Nz)).astype(np.float64)
+        self.Ez_grid_grad_pe = np.zeros((self.Nr, self.Nz)).astype(np.float64)
+
         # electron current density components
         self.Jer_grid = np.zeros((self.Nr, self.Nz)).astype(np.float64)
         self.Jez_grid = np.zeros((self.Nr, self.Nz)).astype(np.float64)
@@ -162,9 +165,12 @@ class HybridPICModel:
         self.phi_grid = np.copy(phi)
         self.Er_grid = np.copy(Er+Er_gradpe)
         self.Ez_grid = np.copy(Ez+Ez_gradpe)
+        self.Er_grid_grad_pe = np.copy(Er_gradpe)
+        self.Ez_grid_grad_pe = np.copy(Ez_gradpe)
         self.Jer_grid = np.copy(Jer)
         self.Jez_grid = np.copy(Jez)
         self.q_ohm_grid = np.copy(q_ohm)
+
 
         self.Er_grid_d = cp.asarray(self.Er_grid)
         self.Ez_grid_d = cp.asarray(self.Ez_grid)
