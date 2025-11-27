@@ -72,15 +72,6 @@ def apply_solid_mask_inplace(fluid, rho, ur, ut, uz):
                 uz[i,k] = 0.0
 
 @njit(parallel=True)
-def apply_solid_mask_inplace_T(fluid, T, T_wall=0):
-    Nr, Nz = T.shape
-    for i in prange(Nr):
-        for k in range(Nz):
-            if fluid[i,k] == 0:
-                if T_wall == T_wall:
-                    T[i,k] = T_wall
-
-@njit(parallel=True)
 def div_stress_tensor_masked(r, dr, dz,
                              tau_rr, tau_tt, tau_zz, tau_rz, tau_rt, tau_tz,
                              div_tau_r, div_tau_t, div_tau_z,
@@ -210,17 +201,18 @@ def rusanov_div_scalar_masked(q, ur, uz, r, dr, dz, a_r, a_z, out,
                               face_r=None, face_z=None, fluid=None):
     """
     Rusanov ∇·(q u) with optional solid masks.
-      face_r: (Nr+1, Nz)  {0,1} mask that *opens* radial faces
-      face_z: (Nr, Nz+1)  {0,1} mask that *opens* axial  faces
-      fluid : (Nr, Nz)    {0,1} cell mask (1=fluid, 0=solid)
+    Updated to compute divergence on the FULL domain [0, Nr-1] and [0, Nz-1]
+    by assuming zero flux at the physical boundaries (r=0, r=R, z=0, z=L).
     """
     Nr, Nz = q.shape
     Fr = np.zeros((Nr+1, Nz))
     Fz = np.zeros((Nr,   Nz+1))
 
-    # radial faces
+    # radial faces (1..Nr-1)
+    # Fr[i] is face between cell i-1 and i
+    # Fr[0] and Fr[Nr] remain 0.0 (impermeable domain walls/axis)
     for i in prange(1, Nr):
-        for k in range(1, Nz-1):
+        for k in range(0, Nz): # Full Z range to support boundary updates
             qL = q[i-1,k]; qR = q[i,k]
             uL = ur[i-1,k]; uR = ur[i,k]
             a  = max(a_r[i-1,k], a_r[i,k])
@@ -231,8 +223,10 @@ def rusanov_div_scalar_masked(q, ur, uz, r, dr, dz, a_r, a_z, out,
                 flux *= face_r[i,k]    # close face if 0
             Fr[i,k] = flux
 
-    # axial faces
-    for i in prange(1, Nr-1):
+    # axial faces (1..Nz-1)
+    # Fz[k] is face between cell k-1 and k
+    # Fz[0] and Fz[Nz] remain 0.0 (impermeable domain walls)
+    for i in prange(0, Nr): # Full R range
         for k in range(1, Nz):
             qL = q[i,k-1]; qR = q[i,k]
             uL = uz[i,k-1]; uR = uz[i,k]
@@ -244,13 +238,42 @@ def rusanov_div_scalar_masked(q, ur, uz, r, dr, dz, a_r, a_z, out,
                 flux *= face_z[i,k]
             Fz[i,k] = flux
 
-    # axisymmetric divergence
-    for i in prange(1, Nr-1):
-        rip = 0.5*(r[i] + r[i+1])
-        rim = 0.5*(r[i] + r[i-1])
-        for k in range(1, Nz-1):
-            dFr = (rip*Fr[i+1,k] - rim*Fr[i,k])/(r[i]*dr)
-            dFz = (Fz[i,k+1] - Fz[i,k])/dz
+    # Axisymmetric divergence on FULL domain (0..Nr-1, 0..Nz-1)
+    for i in prange(0, Nr):
+        # Prepare geometric factors
+        if i == 0:
+            # Axis case: Limit r->0 of (1/r) d(rF)/dr
+            # Using FV limit for wedge volume: Div = 4 * Fr[1] / dr
+            # (Flux_left is 0 at axis)
+            rip = 0.0 # Not used for axis special logic below, but strictly r[0]+dr/2
+            rim = 0.0
+            inv_vol = 0.0 # Handled logic below
+        elif i == Nr-1:
+            # Wall case: Flux_right (Fr[Nr]) is 0.
+            # Volume centered at r[Nr-1].
+            rip = r[i] + 0.5*dr # Right face radius
+            rim = r[i] - 0.5*dr # Left face radius
+            inv_vol = 1.0 / (r[i] * dr)
+        else:
+            # Standard interior
+            rip = 0.5*(r[i] + r[i+1])
+            rim = 0.5*(r[i] + r[i-1])
+            inv_vol = 1.0 / (r[i] * dr)
+
+        for k in range(0, Nz):
+            # --- Radial contribution ---
+            if i == 0:
+                # Singularity handling: 4 * Flux_Right / dr
+                dFr = 4.0 * Fr[1, k] / dr
+            else:
+                # Standard FV divergence: (r+ F+ - r- F-) / (r dr)
+                # Note: Fr[i+1] is right face, Fr[i] is left face
+                dFr = (rip * Fr[i+1, k] - rim * Fr[i, k]) * inv_vol
+
+            # --- Axial contribution ---
+            # Fz[k+1] is Top face, Fz[k] is Bottom face
+            dFz = (Fz[i, k+1] - Fz[i, k]) / dz
+
             val = dFr + dFz
             if fluid is not None and fluid[i,k] == 0:
                 val = 0.0
@@ -310,8 +333,9 @@ def mom_rhs(r, rho, ur, ut, uz, p,
             rhs_r, rhs_t, rhs_z,
             fluid=None, face_r=None, face_z=None):
     """
-    Corrected momentum RHS function. It now calls the correct divergence
-    function and includes the previously missing Coriolis force.
+    Compute the right-hand-side of the momentum equation:
+      RHS = -∇p + ∇·τ + F_curvature + F_drag
+    with optional solid masks.
     """
     Nr, Nz = rho.shape
 
@@ -350,6 +374,7 @@ def mom_rhs(r, rho, ur, ut, uz, p,
             rhs_t[i, k] =          div_tau_t[i, k] + curv_t
             rhs_z[i, k] = -dp_dz + div_tau_z[i, k]
 
+
 @njit(parallel=True, fastmath=True, cache=True)
 def energy_rhs_masked(r, ur, ut, uz, p, T, kappa,
                       tau_rr, tau_tt, tau_zz, tau_rz, tau_rt, tau_tz,
@@ -368,7 +393,20 @@ def energy_rhs_masked(r, ur, ut, uz, p, T, kappa,
     # radial faces i = 1..Nr-1, k = 1..Nz-2 valid
     for i in prange(1, Nr):
         for k in range(1, Nz-1):
-            if (face_r is None) or (face_r[i, k] == 1):
+            # Check if this face allows conduction.
+            # Conduct if face is open in face_r OR if it is a solid-fluid boundary
+            conduct = False
+            if face_r is None:
+                conduct = True
+            elif face_r[i, k] == 1:
+                conduct = True
+            elif fluid is not None:
+                # Allow flux if at least one neighbor is fluid (Solid-Fluid interface)
+                # Face i is between cell i-1 and cell i
+                if (fluid[i, k] == 1) or (fluid[i-1, k] == 1):
+                    conduct = True
+
+            if conduct:
                 # arithmetic average of kappa to the face
                 kf = 0.5 * (kappa[i, k] + kappa[i-1, k])
                 G_r[i, k] = kf * (T[i, k] - T[i-1, k]) / dr
@@ -378,7 +416,18 @@ def energy_rhs_masked(r, ur, ut, uz, p, T, kappa,
     # axial faces i = 1..Nr-2, k = 1..Nz-1 valid
     for i in prange(1, Nr-1):
         for k in range(1, Nz):
-            if (face_z is None) or (face_z[i, k] == 1):
+            conduct = False
+            if face_z is None:
+                conduct = True
+            elif face_z[i, k] == 1:
+                conduct = True
+            elif fluid is not None:
+                # Allow flux if at least one neighbor is fluid
+                # Face k is between cell k-1 and cell k
+                if (fluid[i, k] == 1) or (fluid[i, k-1] == 1):
+                    conduct = True
+
+            if conduct:
                 kf = 0.5 * (kappa[i, k] + kappa[i, k-1])
                 G_z[i, k] = kf * (T[i, k] - T[i, k-1]) / dz
             else:
@@ -419,7 +468,6 @@ def energy_rhs_masked(r, ur, ut, uz, p, T, kappa,
 
     # ---------------------------
     # 3) Viscous dissipation Φ = τ:∇u (masked derivatives)
-    #    Use same masked stencil as momentum/stresses near walls
     # ---------------------------
     dur_dr = np.zeros_like(ur); grad_r_masked(ur, dr, dur_dr, face_r)
     dut_dr = np.zeros_like(ut); grad_r_masked(ut, dr, dut_dr, face_r)
@@ -452,7 +500,6 @@ def energy_rhs_masked(r, ur, ut, uz, p, T, kappa,
                 divu[i, k] = 0.0
             out[i, k]      = S
             divu_out[i, k] = divu[i, k]
-
 
 @njit(parallel=True, fastmath=True, cache=True)
 def step_isothermal(r, dr, dz, dt,
@@ -533,15 +580,15 @@ def step_isothermal(r, dr, dz, dt,
     rusanov_div_scalar_masked(rho, ur, uz, r, dr, dz, a_r, a_z, divF,
                               face_r=face_r, face_z=face_z, fluid=fluid)
 
-    for i in prange(1, Nr-1):
-        for k in range(1, Nz-1):
+    for i in prange(0, Nr):
+        for k in range(0, Nz):
             if (fluid is None) or (fluid[i,k] == 1):
                 rho[i,k] -= dt * divF[i,k]
             # else: keep rho as-is in solid
 
     # ---- positivity clamp in fluid cells
-    for i in prange(1, Nr-1):
-        for k in range(1, Nz-1):
+    for i in prange(0, Nr):
+        for k in range(0, Nz):
             if ((fluid is None) or (fluid[i,k] == 1)) and (rho[i,k] < rho_floor):
                 rho[i,k] = rho_floor
 
@@ -552,7 +599,7 @@ def step_temperature_masked(r, dr, dz, dt,
                             tau_rr, tau_tt, tau_zz, tau_rz, tau_rt, tau_tz,
                             c_v,
                             fluid=None, face_r=None, face_z=None,
-                            T_floor=1.0, T_wall=np.nan):
+                            T_floor=300.0):
     """
     ∂t T = -∇·(T u) + T ∇·u + [ -p ∇·u + ∇·(k∇T) + Φ ] / (ρ c_v)
     with masked advection and zero sources inside solids.
@@ -592,8 +639,8 @@ def step_temperature_masked(r, dr, dz, dt,
         for k in range(1, Nz-1):
             if T[i,k] < T_floor:
                 T[i,k] = T_floor
-            if fluid is not None and fluid[i,k] == 0 and T_wall == T_wall:
-                T[i,k] = T_wall
+            #if fluid is not None and fluid[i,k] == 0 and T_wall == T_wall:
+            #    T[i,k] = T_wall
 
 ###########################################################################################################
 ############################ Parameters for viscosity and conductivity calculation ########################
@@ -748,9 +795,6 @@ def viscosity_and_conductivity(
     mu[geom.mask==0]*=0; k[geom.mask==0]*=0
     return mu, k, used
 
-############################################################################################
-############################################################################################
-
 @njit(parallel=True, cache=True)
 def update_u_in_collisions(
     mask, rho_i, rho_n,
@@ -782,3 +826,31 @@ def update_u_in_collisions(
                 Tn_new[i, j] = Tn[i, j] + factor/c_v*du2 + factor*(Ti[i, j] - Tn[i, j])
 
     return un_r_new, un_t_new, un_z_new, Tn_new
+
+
+@njit(parallel=True)
+def compute_knudsen_field(mask, T, p, sigma, L_char, kb, out):
+    """
+    Computes local Knudsen number Kn = lambda / L_char
+    Mean free path lambda = k_B * T / (sqrt(2) * pi * sigma^2 * p)
+    """
+    Nr, Nz = T.shape
+    # Precompute constant factor: k_B / (sqrt(2) * pi * sigma^2)
+
+    prefactor = kb / (1.41421356 * 3.14159265 * sigma**2)
+    inv_L = 1.0 / L_char
+
+    for i in prange(Nr):
+        for k in range(Nz):
+            if(mask[i, k] == 0):
+                out[i, k] = 0.0
+                continue
+            # p can be very close to zero in centrifuge core (vacuum).
+            # If p -> 0, lambda -> infinity, Kn -> infinity.
+            # We clamp to a large number or 0 depending on preference. 
+            # Here we just compute valid values and set 0.0 for pure vacuum.
+            if p[i, k] > 1e-20:
+                lam = prefactor * T[i, k] / p[i, k]
+                out[i, k] = lam * inv_L
+            else:
+                out[i, k] = 0.0 # Vacuum
