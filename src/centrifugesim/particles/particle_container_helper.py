@@ -1,5 +1,5 @@
 import numpy as np
-from numba import njit
+from numba import njit, prange
 
 @njit(parallel=False)
 def cic_deposit_renormalized(p_r, p_z, p_w, mask, dr, dz, r_min, z_min):
@@ -64,3 +64,94 @@ def cic_deposit_renormalized(p_r, p_z, p_w, mask, dr, dz, r_min, z_min):
             if valid11: density_accum[ir + 1, iz + 1] += w11 * scale
             
     return density_accum
+
+#################################################################################
+############################# RZ Bilinear Smoothing #############################
+#################################################################################
+
+@njit(parallel=True, fastmath=True)
+def rz_bilinear_smooth(ns, mask, r_coords, nr, nz):
+    """
+    Applies an RZ-compatible bilinear filter to density ns.
+    Method: Separable convolution with Volume Weighting.
+    """
+    # 1. Allocate buffers
+    ns_z_smoothed = np.zeros_like(ns)
+    ns_final = np.zeros_like(ns)
+    
+    # Kernel weights (3-point)
+    w = np.array([0.25, 0.5, 0.25])
+    
+    # =========================================================
+    # PASS 1: Z-Direction (Axial)
+    # Volume is constant along Z lines, so standard smoothing applies.
+    # =========================================================
+    for i in prange(nr):
+        for j in range(nz):
+            if mask[i, j] == 0:
+                continue
+
+            num = 0.0
+            den = 0.0
+            
+            # Iterate kernel: j-1, j, j+1
+            for k in range(-1, 2):
+                neighbor_j = j + k
+                
+                # Check Bounds
+                if neighbor_j >= 0 and neighbor_j < nz:
+                    # Check Mask
+                    if mask[i, neighbor_j] == 1:
+                        num += ns[i, neighbor_j] * w[k+1]
+                        den += w[k+1]
+            
+            if den > 1e-12:
+                ns_z_smoothed[i, j] = num / den
+            else:
+                ns_z_smoothed[i, j] = ns[i, j]
+
+    # =========================================================
+    # PASS 2: R-Direction (Radial)
+    # Volume varies with R. We must weight by Radius.
+    # Formula: Sum(n * w * r) / Sum(w * r)
+    # =========================================================
+    dr = r_coords[1] - r_coords[0]
+    
+    # Effective radius for the axis node (r=0) to prevent weight collapse
+    # We treat the axis node as representing the volume centroid of the first cell
+    r_axis_eff = dr * 0.25
+
+    for j in prange(nz):
+        for i in range(nr):
+            if mask[i, j] == 0:
+                continue
+
+            num = 0.0
+            den = 0.0
+            
+            for k in range(-1, 2):
+                neighbor_i = i + k
+                
+                if neighbor_i >= 0 and neighbor_i < nr:
+                    if mask[neighbor_i, j] == 1:
+                        # Determine Geometric Weight (Radius)
+                        r_neighbor = r_coords[neighbor_i]
+                        
+                        # Handle Axis Singularity
+                        if r_neighbor < 1e-12:
+                            r_val = r_axis_eff
+                        else:
+                            r_val = r_neighbor
+                        
+                        # Apply Weight: Kernel * Geometry
+                        weight = w[k+1] * r_val
+                        
+                        num += ns_z_smoothed[neighbor_i, j] * weight
+                        den += weight
+            
+            if den > 1e-12:
+                ns_final[i, j] = num / den
+            else:
+                ns_final[i, j] = ns_z_smoothed[i, j]
+
+    return ns_final
