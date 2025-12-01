@@ -5,6 +5,7 @@ import centrifugesim.constants as constants
 from . import particle_container_kernels
 
 from centrifugesim.initialization.init_particles import initialize_ions_from_ni_nppc
+from centrifugesim.particles.particle_container_helper import cic_deposit_renormalized
 
 class ParticleContainer:
 
@@ -22,6 +23,13 @@ class ParticleContainer:
         self.rmax_BC = rmax_BC
         self.zmin_BC = zmin_BC
         self.zmax_BC = zmax_BC
+
+        # Lists to store recombined particle data
+        self.recombined_p_r = []
+        self.recombined_p_z = []
+        self.recombined_p_vr = []
+        self.recombined_p_vz = []
+        self.recombined_p_weight = []
 
         # Allocate arrays for positions (r, z), velocities (v_r, v_t, v_z) and weights
         self.r = None
@@ -108,10 +116,19 @@ class ParticleContainer:
 
         self.r[:] = r_new
         
-        self.ApplyBCparticles(geom, self.rmax_p, self.zmin_p, self.zmax_p)
+        self.ApplyBCparticles(geom, self.rmax_p, self.zmin_p, self.zmax_p, dt)
 
 
-    def ApplyBCparticles(self, geom, rmax, zmin, zmax):
+    def ApplyBCparticles(self, geom, rmax, zmin, zmax, dt):
+
+        self.recombined_p_r = []
+        self.recombined_p_z = []
+
+        self.recombined_p_vr = []
+        self.recombined_p_vz = []
+
+        self.recombined_p_weight = []
+
         L = zmax-zmin
 
         # check particles with r<0
@@ -142,6 +159,11 @@ class ParticleContainer:
                 self.vz[ind_zmin] = cp.abs(self.vz[ind_zmin])
 
             elif(self.zmin_BC=="absorbing"):
+                self.recombined_p_r.extend(cp.asnumpy(self.r[ind_zmin]))
+                self.recombined_p_z.extend(cp.asnumpy(self.z[ind_zmin]))
+                self.recombined_p_vr.extend(cp.asnumpy(self.vr[ind_zmin]))
+                self.recombined_p_vz.extend(cp.asnumpy(self.vz[ind_zmin]))
+                self.recombined_p_weight.extend(cp.asnumpy(self.weight[ind_zmin]))
                 self.remove_indices_and_free_memory(ind_zmin)
 
             elif(self.zmin_BC=="periodic"):
@@ -153,24 +175,40 @@ class ParticleContainer:
         if(ind_zmax.shape[0]>0):
 
             if(self.zmax_BC=="reflecting"):
-                self.z[ind_zmax] = zmax
                 self.vz[ind_zmax] = -cp.abs(self.vz[ind_zmax])
+                self.z[ind_zmax] = zmax+self.vz[ind_zmax]*dt
+                
 
             elif(self.zmax_BC=="absorbing"):
+                self.recombined_p_r.extend(cp.asnumpy(self.r[ind_zmax]))
+                self.recombined_p_z.extend(cp.asnumpy(self.z[ind_zmax]))
+                self.recombined_p_vr.extend(cp.asnumpy(self.vr[ind_zmax]))
+                self.recombined_p_vz.extend(cp.asnumpy(self.vz[ind_zmax]))
+                self.recombined_p_weight.extend(cp.asnumpy(self.weight[ind_zmax]))
                 self.remove_indices_and_free_memory(ind_zmax)
-
+                
             elif(self.zmax_BC=="periodic"):
                 self.z[ind_zmax] -= L
 
         # check if particles are asorbed at cathode:
         ind_cathode = cp.flatnonzero(cp.logical_and(self.r<geom.rmax_cathode,self.z<geom.zmax_cathode))
         if(ind_cathode.shape[0]>0):
+            self.recombined_p_r.extend(cp.asnumpy(self.r[ind_cathode]))
+            self.recombined_p_z.extend(cp.asnumpy(self.z[ind_cathode]))
+            self.recombined_p_vr.extend(cp.asnumpy(self.vr[ind_cathode]))
+            self.recombined_p_vz.extend(cp.asnumpy(self.vz[ind_cathode]))
+            self.recombined_p_weight.extend(cp.asnumpy(self.weight[ind_cathode]))
             self.remove_indices_and_free_memory(ind_cathode)
 
         # check if particles are absorbed at first anode:
         ind_anode_1 = cp.flatnonzero(cp.logical_and(self.r>geom.rmin_anode,
                         cp.logical_and(self.z>geom.zmin_anode,self.z<geom.zmax_anode)))
         if(ind_anode_1.shape[0]>0):
+            self.recombined_p_r.extend(cp.asnumpy(self.r[ind_anode_1]))
+            self.recombined_p_z.extend(cp.asnumpy(self.z[ind_anode_1]))
+            self.recombined_p_vr.extend(cp.asnumpy(self.vr[ind_anode_1]))
+            self.recombined_p_vz.extend(cp.asnumpy(self.vz[ind_anode_1]))
+            self.recombined_p_weight.extend(cp.asnumpy(self.weight[ind_anode_1]))
             self.remove_indices_and_free_memory(ind_anode_1)
 
         # check if particles are absorbed at second anode:
@@ -178,8 +216,22 @@ class ParticleContainer:
         ind_anode_2 = cp.flatnonzero(cp.logical_and(self.r>geom.rmin_anode,
                         cp.logical_and(self.z>geom.zmin_anode2,self.z<geom.zmax_anode2)))
         if(ind_anode_2.shape[0]>0):
+            self.recombined_p_r.extend(cp.asnumpy(self.r[ind_anode_2]))
+            self.recombined_p_z.extend(cp.asnumpy(self.z[ind_anode_2]))
+            self.recombined_p_vr.extend(cp.asnumpy(self.vr[ind_anode_2]))
+            self.recombined_p_vz.extend(cp.asnumpy(self.vz[ind_anode_2]))
+            self.recombined_p_weight.extend(cp.asnumpy(self.weight[ind_anode_2]))
             self.remove_indices_and_free_memory(ind_anode_2)
 
+        if(len(self.recombined_p_r)>0):
+            self.recombined_p_r = np.array(self.recombined_p_r)
+            self.recombined_p_z = np.array(self.recombined_p_z)
+            self.recombined_p_vr = np.array(self.recombined_p_vr)
+            self.recombined_p_vz = np.array(self.recombined_p_vz)
+            self.recombined_p_weight = np.array(self.recombined_p_weight)
+
+            self.recombined_p_r -= self.recombined_p_vr*dt
+            self.recombined_p_z -= self.recombined_p_vz*dt
 
     def gatherEandB(self, Er, Et, Ez, Br, Bt, Bz, geom):
         """
@@ -281,12 +333,12 @@ class ParticleContainer:
         self.Js_t[0,:] = 0
         self.Js_z[0,:] = self.Js_z[1,:]
 
-        self.ns[:,0] = self.ns[:,1]
-        self.ns[:,Nz-1] = self.ns[:,Nz-2]
+        #self.ns[:,0] = self.ns[:,1]
+        #self.ns[:,Nz-1] = self.ns[:,Nz-2]
 
         # change to verboncour
-        self.ns[0,:] = self.ns[1,:]
-        self.ns[Nr-1,:] = self.ns[Nr-2,:]
+        #self.ns[0,:] = self.ns[1,:]
+        #self.ns[Nr-1,:] = self.ns[Nr-2,:]
 
         self.Js_r[:,0] = self.Js_r[:,1]
         self.Js_r[:,Nz-1] = self.Js_r[:,Nz-2]
@@ -405,7 +457,7 @@ class ParticleContainer:
             w_new=w_new,
         )
 
-        self.ApplyBCparticles(geom, self.rmax_p, self.zmin_p, self.zmax_p)
+        self.ApplyBCparticles(geom, self.rmax_p, self.zmin_p, self.zmax_p, dt=0.0)
 
     def drag_diffusion(self,
                        Uer, Uet, Uez,
@@ -769,3 +821,40 @@ class ParticleContainer:
         new_r = np.sqrt(u_rand * (r_outer_p**2 - r_inner_p**2) + r_inner_p**2)
 
         return new_r, new_z, new_vr, new_vt, new_vz, weights_p
+
+    def get_recombined_density(self, geom):
+        """
+        Calculates number density (m^-3) conserving mass on valid nodes.
+        Uses geom.volume_field for normalization.
+        
+        Args:
+            geom: Geometry object containing mask, volume_field, dr, dz, etc.
+        """
+        
+        # 1. Accumulate Mass (Renormalized)
+        # This gives us "Total Weight" (N) per cell, conserving particle count near walls.
+        accumulated_weight = cic_deposit_renormalized(
+            self.recombined_p_r,
+            self.recombined_p_z,
+            self.recombined_p_weight,
+            geom.mask,
+            geom.dr, 
+            geom.dz, 
+            geom.rmin,
+            geom.zmin
+        )
+        
+        # 2. Calculate Density (n = N / V)
+        # Using the pre-computed volume field from the geometry object
+        recombined_density = np.zeros_like(accumulated_weight)
+        
+        # Define valid region: mask is valid (1) AND volume is non-zero
+        # This handles both solid boundaries and potential ghost cells
+        valid_indices = (geom.mask == 1) & (geom.volume_field > 0)
+        
+        # Perform division only on valid indices
+        recombined_density[valid_indices] = (
+            accumulated_weight[valid_indices] / geom.volume_field[valid_indices]
+        )
+        
+        return recombined_density

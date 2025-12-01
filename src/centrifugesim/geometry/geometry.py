@@ -94,6 +94,10 @@ class Geometry:
         # Volume weights for particle deposition
         self.volume_field_dep = self.compute_volume_field_dep()
 
+        # For now, check cuda c kernel at z BCs
+        self.volume_field_dep[:,0] = self.volume_field_dep[:,1]
+        self.volume_field_dep[:,-1] = self.volume_field_dep[:,-2]
+
         # Coils store (outside-domain only)
         self.coils: Dict[str, Dict[str, float]] = {}
 
