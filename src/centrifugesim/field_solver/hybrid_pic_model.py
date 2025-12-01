@@ -110,6 +110,7 @@ class HybridPICModel:
             Jiz_cathode = Jiz_grid[i_cathode, j_cathode]
             dphi_dz_vec_aux += Jiz_cathode/sigma_parallel_cathode
 
+        # commenting out for now to avoid unstable behavior at cathode face
         #dpe_dz_cathode = (electron_fluid.pe_grid[i_cathode, j_cathode+1] - electron_fluid.pe_grid[i_cathode, j_cathode])/geom.dz
         #ne_cathode = electron_fluid.ne_grid[i_cathode, j_cathode]
         #dphi_dz_vec_aux += dpe_dz_cathode/(constants.q_e*ne_cathode)
@@ -163,8 +164,8 @@ class HybridPICModel:
         q_ohm = electron_fluid.sigma_P_grid*Er*Er + electron_fluid.sigma_parallel_grid*Ez*Ez
 
         self.phi_grid = np.copy(phi)
-        self.Er_grid = np.copy(Er+Er_gradpe)
-        self.Ez_grid = np.copy(Ez+Ez_gradpe)
+        self.Er_grid = np.copy(Er)
+        self.Ez_grid = np.copy(Ez)
         self.Er_grid_grad_pe = np.copy(Er_gradpe)
         self.Ez_grid_grad_pe = np.copy(Ez_gradpe)
         self.Jer_grid = np.copy(Jer)

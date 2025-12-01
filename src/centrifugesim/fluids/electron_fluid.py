@@ -141,7 +141,7 @@ class ElectronFluidContainer:
         self.sigma_H_grid[:]        = sigma_H_e
         self.beta_e_grid[:]         = _beta_e
 
-    def update_Te(self, geom, hybrid_pic, neutral_fluid, Q_Joule_grid, dt):
+    def update_Te(self, geom, hybrid_pic, neutral_fluid, particle_container, Ts_host, Q_Joule_grid, dt):
         "Update Te function solving energy equation"
         Te_new = np.zeros_like(self.Te_grid)
 
@@ -210,7 +210,7 @@ class ElectronFluidContainer:
         # self.Te_grid_prev = Te_grid.copy() # saving for ion T relaxation
 
         # --- Collision energy exchange term uses the full dt (outside of sub-steps) ---
-        self.compute_elastic_collisions_term(geom, neutral_fluid, dt)
+        self.compute_elastic_collisions_term(geom, neutral_fluid, particle_container, Ts_host, dt)
 
         self.Te_grid[geom.cathode_mask] = geom.temperature_cathode
         self.Te_grid[geom.anode1_mask] = geom.temperature_anode
@@ -222,6 +222,8 @@ class ElectronFluidContainer:
         self,
         geom,
         neutral_fluid,
+        particle_container,
+        Ts_host,
         dt,
         cap=0.1
     ):
@@ -236,10 +238,12 @@ class ElectronFluidContainer:
         nn = np.where(neutral_fluid.nn_grid<neutral_fluid.nn_floor, neutral_fluid.nn_floor, neutral_fluid.nn_grid)
 
         m_ratio_n = constants.m_e/neutral_fluid.mass
+        m_ration_i = constants.m_e/particle_container.m
         
         # Substep count so that both nu_ei*dt_sub and nu_en*dt_sub <= cap (as requested)
         max_nu_dt = 0.0
         max_nu_dt = max(max_nu_dt, float(np.nanmax(self.nu_en_grid * m_ratio_n * dt)))
+        max_nu_dt = max(max_nu_dt, float(np.nanmax(self.nu_ei_grid * m_ration_i * dt)))
         n_sub = int(np.ceil(max(1.0, max_nu_dt / cap)))
         dt_sub = dt / n_sub
 
@@ -248,7 +252,10 @@ class ElectronFluidContainer:
             Q_coll_en = 3 * self.ne_grid * constants.kb * (
                 m_ratio_n * self.nu_en_grid * (self.Te_grid - neutral_fluid.T_n_grid) )
 
-            de = dt_sub*Q_coll_en[geom.mask==1] # J/m^3
+            Q_coll_ei = 3 * self.ne_grid * constants.kb * (
+                m_ration_i * self.nu_ei_grid * (self.Te_grid - Ts_host) )
+
+            de = dt_sub*(Q_coll_en[geom.mask==1] + Q_coll_ei[geom.mask==1]) # J/m^3
 
             # Write back masked regions
             self.Te_grid[geom.mask==1] -= de/(3/2*constants.kb*ne[geom.mask==1])
