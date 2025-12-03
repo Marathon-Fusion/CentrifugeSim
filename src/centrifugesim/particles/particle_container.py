@@ -1,6 +1,8 @@
 import numpy as np
 import cupy as cp
 
+import cupyx.scipy.ndimage as ndimage
+
 import centrifugesim.constants as constants
 from . import particle_container_kernels
 
@@ -615,6 +617,49 @@ class ParticleContainer:
         del delta_ni_d, ni_grid_d, decay_grid_d, ratio, decay_factor_loc, valid_mask
         cp._default_memory_pool.free_all_blocks()
 
+
+    def apply_ionization_from_density_change(self, geom, ni_prev, delta_ni_ionization_grid):
+        """
+        Increases particle weights based on a pre-calculated DENSITY gain grid.
+        
+        Logic:
+            grow_factor = 1.0 + (delta_ni_ionization / current_ion_density)
+        """
+        if self.N == 0:
+            return
+        
+        # Move inputs to GPU
+        delta_ni_d = cp.asarray(delta_ni_ionization_grid).astype(cp.float32)
+        ni_grid_d = cp.asarray(ni_prev).astype(cp.float32)
+
+        # 2. Calculate Decay Factor Grid (1 - delta/total)
+        # Avoid division by zero: if ni is 0, decay is 1.0 (no change)
+        # We construct the factor: F = (ni - delta) / ni = 1 - delta/ni
+        
+        grow_grid_d = cp.ones_like(ni_grid_d)
+        
+        valid_mask = ni_grid_d > 1.0
+        
+        # Calculate ratio only where we have ions
+        ratio = cp.zeros_like(ni_grid_d)
+        ratio[valid_mask] = delta_ni_d[valid_mask] / ni_grid_d[valid_mask]
+        
+        # Safety Clamp: Ratio cannot exceed 1.0 (cannot remove more than 100%)
+        # If chemistry calculated delta > ni (due to sub-cycling vs particle drift),
+        # we cap it at removing 100% of the particles.
+        ratio = cp.clip(ratio, 0.0, 1.0)
+        
+        grow_grid_d += ratio
+
+        # 3. Gather to particle positions
+        grow_factor_loc = self.gatherScalarField(grow_grid_d, geom.dr, geom.dz, geom.zmin)
+        
+        # 4. Apply
+        self.weight *= grow_factor_loc
+
+        del delta_ni_d, ni_grid_d, grow_grid_d, ratio, grow_factor_loc, valid_mask
+        cp._default_memory_pool.free_all_blocks()
+
     def collide_with_neutrals_mcc(
         self,
         geom,
@@ -858,3 +903,130 @@ class ParticleContainer:
         )
         
         return recombined_density
+
+
+    def get_cell_indices(self, geom):
+        """
+        Helper to map (r, z) to linear cell index k.
+        Assumes a uniform grid for speed. 
+        """
+        # Calculate cell widths
+        dr = geom.rmax / geom.Nr  # Assuming r starts at 0
+        dz = (geom.zmax - geom.zmin) / geom.Nz
+        
+        # 1. Map positions to grid indices (i, j)
+        # We clip to ensure we don't access out of bounds for particles exactly on the edge
+        i = cp.floor(self.r / dr).astype(cp.int32)
+        i = cp.clip(i, 0, geom.Nr - 1)
+        
+        j = cp.floor((self.z - geom.zmin) / dz).astype(cp.int32)
+        j = cp.clip(j, 0, geom.Nz - 1)
+        
+        # 2. Compute linear index k = i + j * Nr
+        # This gives a unique ID for every cell
+        k = i + j * geom.Nr
+        return k
+
+    def merge_particles(self, geom, nppc_max=150, nppc_target=100):
+        """
+        Resamples particles in dense cells to reduce count to nppc_target.
+        Conserves Mass exactly. Momentum/Energy conserved statistically.
+        """
+        if self.N == 0:
+            return
+
+        print(f"[{self.name}] Checking for merge/resample...")
+
+        # 1. Get linear cell index for every particle
+        k = self.get_cell_indices(geom)
+        num_cells = geom.Nr * geom.Nz
+
+        # 2. Count particles per cell
+        # bincount is very fast on GPU
+        cell_counts = cp.bincount(k, minlength=num_cells)
+
+        # 3. Identify which cells need thinning
+        # Map the cell counts back to the individual particles
+        # particle_counts[p] tells us how many neighbors particle p has in its cell
+        particle_counts = cell_counts[k]
+
+        # 4. Create a "Keep" mask
+        # If count <= max, keep probability is 1.0 (keep everything)
+        # If count > max, keep probability is target / count
+        
+        # We generate random numbers for every particle
+        random_draws = cp.random.random(self.N)
+        
+        # Calculate probability to keep specific particle
+        # We use 'where' to handle the logic vectorially
+        keep_probs = cp.where(
+            particle_counts > nppc_max, 
+            nppc_target / particle_counts, 
+            1.0
+        )
+        
+        # The boolean mask of particles we will actually keep
+        keep_mask = random_draws < keep_probs
+
+        # --- CONSERVATION STEP ---
+        
+        # To conserve Charge/Mass exactly, we must scale the weights of the survivors.
+        # We calculate the total weight in the cell BEFORE thinning, 
+        # and the total weight in the cell AFTER thinning (but before scaling).
+        
+        # Sum of weights per cell (Original)
+        mass_before = cp.bincount(k, weights=self.weight, minlength=num_cells)
+        
+        # Sum of weights of the *survivors* per cell
+        # We weight by (self.weight * keep_mask)
+        mass_survivors = cp.bincount(k, weights=(self.weight * keep_mask), minlength=num_cells)
+        
+        # Calculate the scaling factor for each cell
+        # factor = mass_before / mass_survivors
+        # Handle division by zero for empty cells or cells where we kept nothing (rare)
+        scale_factors = cp.zeros_like(mass_before)
+        nonzero = mass_survivors > 0
+        scale_factors[nonzero] = mass_before[nonzero] / mass_survivors[nonzero]
+        
+        # Map these factors back to the particles
+        particle_scale_factors = scale_factors[k]
+        
+        # 5. Apply changes
+        
+        # Update weights of ALL particles (we will discard the False ones in a second)
+        # This ensures the survivors carry the weight of the fallen
+        self.weight *= particle_scale_factors
+        
+        # Filter arrays
+        num_kept = int(cp.sum(keep_mask))
+        num_discarded = self.N - num_kept
+
+        if num_discarded > 0:
+            self.r = self.r[keep_mask]
+            self.z = self.z[keep_mask]
+            self.vr = self.vr[keep_mask]
+            self.vt = self.vt[keep_mask]
+            self.vz = self.vz[keep_mask]
+            self.weight = self.weight[keep_mask]
+            
+            # Update Total Number
+            self.N = num_kept
+            print(f"    Merged: Removed {num_discarded} particles. New N: {self.N}")
+        else:
+            print("    No merging needed.")
+
+    def sort_particles(self, geom):
+        """
+        Optional: Physically reorder particles in memory by cell index.
+        This improves cache locality for the PIC deposit/push and is 
+        usually good to run before merging.
+        """
+        k = self.get_cell_indices(geom)
+        sort_indices = cp.argsort(k)
+        
+        self.r = self.r[sort_indices]
+        self.z = self.z[sort_indices]
+        self.vr = self.vr[sort_indices]
+        self.vt = self.vt[sort_indices]
+        self.vz = self.vz[sort_indices]
+        self.weight = self.weight[sort_indices]
