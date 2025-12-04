@@ -141,7 +141,7 @@ class ElectronFluidContainer:
         self.sigma_H_grid[:]        = sigma_H_e
         self.beta_e_grid[:]         = _beta_e
 
-    def update_Te(self, geom, hybrid_pic, neutral_fluid, particle_container, Ts_host, Q_Joule_grid, dt):
+    def update_Te(self, geom, hybrid_pic, neutral_fluid, particle_container, Ts_host, Q_Joule_grid, dt, p_RF=None):
         "Update Te function solving energy equation"
         Te_new = np.zeros_like(self.Te_grid)
 
@@ -164,6 +164,8 @@ class ElectronFluidContainer:
             dt_stable = dt  # no diffusion -> no stability restriction
 
         Q_Joule_grid = np.where(self.ne_grid<self.ne0, 0, Q_Joule_grid)
+        if p_RF is not None:
+            Q_Joule_grid += p_RF
 
         # Helper to perform one advance with a given local dt
         def _advance(dt_local):

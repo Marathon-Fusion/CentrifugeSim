@@ -111,9 +111,9 @@ class HybridPICModel:
             dphi_dz_vec_aux += Jiz_cathode/sigma_parallel_cathode
 
         # commenting out for now to avoid unstable behavior at cathode face
-        #dpe_dz_cathode = (electron_fluid.pe_grid[i_cathode, j_cathode+1] - electron_fluid.pe_grid[i_cathode, j_cathode])/geom.dz
-        #ne_cathode = electron_fluid.ne_grid[i_cathode, j_cathode]
-        #dphi_dz_vec_aux += dpe_dz_cathode/(constants.q_e*ne_cathode)
+        dpe_dz_cathode = (electron_fluid.pe_grid[i_cathode, j_cathode+1] - electron_fluid.pe_grid[i_cathode, j_cathode])/geom.dz
+        ne_cathode = electron_fluid.ne_grid[i_cathode, j_cathode]
+        dphi_dz_vec_aux += dpe_dz_cathode/(constants.q_e*ne_cathode)
         
         # flipping sign here due to how the solver was written
         dphi_dz_vec[i_cathode] = - dphi_dz_vec_aux 
