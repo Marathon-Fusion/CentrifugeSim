@@ -382,6 +382,6 @@ def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
             # =========================
             # 3. Update
             # =========================
-            rhs = -div_q - div_Fadv + Q_Joule[i, j]
+            rhs = -div_q - div_Fadv*0 + Q_Joule[i, j]
             dTe_dt = (2.0 / (3.0 * n_e[i, j] * kb)) * rhs
             Te_new[i, j] = Te[i, j] + dt * dTe_dt

@@ -331,9 +331,9 @@ class ParticleContainer:
         self.Js_z = self.Js_z/volume_field_d
 
         # Write apply_BC_Js and call here for each component.
-        self.Js_r[0,:] = 0
-        self.Js_t[0,:] = 0
-        self.Js_z[0,:] = self.Js_z[1,:]
+        #self.Js_r[0,:] = 0
+        #self.Js_t[0,:] = 0
+        #self.Js_z[0,:] = self.Js_z[1,:]
 
         #self.ns[:,0] = self.ns[:,1]
         #self.ns[:,Nz-1] = self.ns[:,Nz-2]
@@ -342,14 +342,14 @@ class ParticleContainer:
         #self.ns[0,:] = self.ns[1,:]
         #self.ns[Nr-1,:] = self.ns[Nr-2,:]
 
-        self.Js_r[:,0] = self.Js_r[:,1]
-        self.Js_r[:,Nz-1] = self.Js_r[:,Nz-2]
+        #self.Js_r[:,0] = self.Js_r[:,1]
+        #self.Js_r[:,Nz-1] = self.Js_r[:,Nz-2]
 
-        self.Js_t[:,0] = self.Js_t[:,1]
-        self.Js_t[:,Nz-1] = self.Js_t[:,Nz-2]
+        #self.Js_t[:,0] = self.Js_t[:,1]
+        #self.Js_t[:,Nz-1] = self.Js_t[:,Nz-2]
 
-        self.Js_z[:,0] = self.Js_z[:,1]
-        self.Js_z[:,Nz-1] = self.Js_z[:,Nz-2]
+        #self.Js_z[:,0] = self.Js_z[:,1]
+        #self.Js_z[:,Nz-1] = self.Js_z[:,Nz-2]
 
     def depositTemperature_dim(self, u_field, vp, dr, dz, zmin, Nr, Nz):
 
