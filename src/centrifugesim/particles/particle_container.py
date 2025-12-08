@@ -764,6 +764,103 @@ class ParticleContainer:
         del un_r_device, un_t_device, un_z_device
         cp._default_memory_pool.free_all_blocks()
 
+    def do_charge_exchange(
+        self,
+        geom,
+        Tn_host, nn_host,
+        un_r_host, un_t_host, un_z_host,
+        m_n,
+        dt,
+        sigma_mt=5e-19,
+        seed=None
+    ):
+        """
+        Charge-exchange collisions with background neutrals.
+
+        Parameters
+        ----------
+        Tn_host : np.ndarray, shape (Nr,Nz), float64
+            Neutral temperature field [K] on host.
+        nn_host : np.ndarray, shape (Nr,Nz), float64
+            Neutral number density field [m^-3] on host.
+        un_r_host, un_theta_host, un_z_host : np.ndarray (Nr,Nz), float64
+            Neutral bulk velocity components [m/s] on host, cylindrical components.
+        m_n : float
+            Neutral mass [kg].
+        sigma_mt : float, optional
+            Momentum-transfer cross-section [m^2]. Default 5e-19.
+        seed : int or None
+            RNG seed for reproducibility of collision sampling.
+
+        Notes
+        -----
+        * Uses P_coll = 1 - exp(-nn * sigma_mt * u * dt) with u = |v_i - v_n|.
+        * Samples one neutral velocity from a Maxwellian at local Tn and bulk (u_n) per ion.
+        * Post-collision ion velocity is set to the sampled neutral velocity.
+        """
+        # check number of ions
+        N = self.N
+        if N == 0:
+            return  # nothing to do
+
+        m_i = float(self.m)
+
+        Tn_device = cp.asarray(Tn_host).astype(cp.float32)
+        nn_device = cp.asarray(nn_host).astype(cp.float32)
+        un_r_device = cp.asarray(un_r_host).astype(cp.float32)
+        un_t_device = cp.asarray(un_t_host).astype(cp.float32)
+        un_z_device = cp.asarray(un_z_host).astype(cp.float32)
+
+        # Gather local neutral state at particle positions
+        Tn_loc = self.gatherScalarField(Tn_device, geom.dr, geom.dz, geom.zmin)     # [K]      
+        nn_loc = self.gatherScalarField(nn_device, geom.dr, geom.dz, geom.zmin)     # [m^-3]
+        unr_loc = self.gatherScalarField(un_r_device, geom.dr, geom.dz, geom.zmin)  # [m/s]
+        unt_loc = self.gatherScalarField(un_t_device, geom.dr, geom.dz, geom.zmin)  # [m/s]
+        unz_loc = self.gatherScalarField(un_z_device, geom.dr, geom.dz, geom.zmin)  # [m/s]
+
+        # Output buffers (in-place is fine, but separate arrays keep it safe)
+        vr_out = cp.empty_like(self.vr)
+        vt_out = cp.empty_like(self.vt)
+        vz_out = cp.empty_like(self.vz)
+
+        # Random numbers: generate with NumPy then move to CuPy (as requested)
+        rcoll = cp.random.rand(N, dtype=cp.float32)     # collision acceptance
+
+        # Gaussian random numbers for neutral thermal velocities
+        g1    = cp.random.randn(N, dtype=cp.float32)    # Gaussian for neutral thermal vx
+        g2    = cp.random.randn(N, dtype=cp.float32)    # Gaussian for neutral thermal vy
+        g3    = cp.random.randn(N, dtype=cp.float32)    # Gaussian for neutral thermal vz
+
+        # Sample neutral velocity from drifting maxwellian
+        vnr = unr_loc + cp.sqrt((2.0 * constants.kb * Tn_loc) / m_n) * g1
+        vnt = unt_loc + cp.sqrt((2.0 * constants.kb * Tn_loc) / m_n) * g2
+        vnz = unz_loc + cp.sqrt((2.0 * constants.kb * Tn_loc) / m_n) * g3
+
+        # calculate umag
+        udiff_r = self.vr - vnr
+        udiff_t = self.vt - vnt
+        udiff_z = self.vz - vnz
+        umag = cp.sqrt(udiff_r**2 + udiff_t**2 + udiff_z**2)  # [m/s]
+
+        # Probability of collision
+        P = 1.0 - cp.exp(- nn_loc * sigma_mt * umag * dt)
+
+        # do collisions
+        collided = rcoll < P
+        if(len(collided)>0):
+            self.vr[collided] = vnr[collided]
+            self.vt[collided] = vnt[collided]
+            self.vz[collided] = vnz[collided]
+
+        # del and free memory
+        del vr_out, vt_out, vz_out
+        del g1, g2, g3
+        del rcoll
+        del Tn_loc, nn_loc, unr_loc, unt_loc, unz_loc
+        del Tn_device, nn_device
+        del un_r_device, un_t_device, un_z_device
+        cp._default_memory_pool.free_all_blocks()
+
     def inject_cathode_ions(self, geom, hybrid_pic, electron_fluid, neutral_fluid, dt, nppc_inj=5):
         """
         Injects new ion macroparticles at the cathode exit plane.
