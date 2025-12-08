@@ -468,7 +468,8 @@ class ParticleContainer:
                        n_floor,
                        dr, dz,
                        zmin,
-                       dt):
+                       dt,
+                       do_ions=False):
         """
         Uer, Uet, Uez, ne, Te and nu_ei are host arrays here (Nr, Nz)
         """
@@ -491,7 +492,10 @@ class ParticleContainer:
 
         if(ind.shape[0]>0):
 
-            nu_drag_p = nu_ei_p*constants.m_e/self.m
+            nu_drag_p = nu_ei_p
+            if (do_ions==False):
+                nu_drag_p*=constants.m_e/self.m
+                
             D_p = nu_drag_p*constants.kb*Te_p/self.m
             diffusion_term_p = cp.sqrt(2*D_p*dt)
 
