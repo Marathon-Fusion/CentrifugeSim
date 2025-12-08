@@ -84,6 +84,12 @@ class Geometry:
         # find arrays with valid nodes right next to masked ones.
         self.i_bc_list, self.j_bc_list = self.find_boundary_nodes()
 
+        # Separate lists for cathode and anode BC nodes
+        self.anode_mask = np.ones((self.Nr, self.Nz), dtype=np.int8)
+        self.anode_mask[self.anode1_mask] = 0
+        self.anode_mask[self.anode2_mask] = 0
+        self.i_anode_bc_list, self.j_anode_bc_list = self.find_boundary_nodes(mask=self.anode_mask)
+
         # Cathode and anode temperatures
         self.temperature_cathode = temperature_cathode
         self.temperature_anode = temperature_anode
@@ -396,12 +402,13 @@ class Geometry:
 
         return vol_dep
 
-    def find_boundary_nodes(self):
+    def find_boundary_nodes(self, mask=None):
         """
         Finds fluid nodes (mask == 1) that are adjacent to at least one
         solid node (mask == 0) using explicit Python loops.
         """
-        mask = self.mask
+        if mask is None:
+            mask = self.mask
         Nr, Nz = self.Nr, self.Nz
         
         i_bc_list: List[int] = []
@@ -413,7 +420,7 @@ class Geometry:
         for i in range(self.Nr):
             for j in range(self.Nz):
                 # Condition 1: Must be a fluid node
-                if self.mask[i, j] == 1:
+                if mask[i, j] == 1:
                     is_boundary = False
                     
                     # Condition 2: Check all 4 neighbors
@@ -423,7 +430,7 @@ class Geometry:
                         # Check if the neighbor is *within the grid bounds*
                         if 0 <= ni < self.Nr and 0 <= nj < self.Nz:
                             # If neighbor is within bounds, check if it's solid
-                            if self.mask[ni, nj] == 0:
+                            if mask[ni, nj] == 0:
                                 is_boundary = True
                                 # Found one, no need to check other neighbors
                                 break 

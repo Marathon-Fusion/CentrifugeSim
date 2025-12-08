@@ -36,6 +36,7 @@ class ElectronFluidContainer:
 
         self.nu_ei_grid = np.zeros((geom.Nr,geom.Nz)).astype(np.float64)
         self.nu_en_grid = np.zeros((geom.Nr,geom.Nz)).astype(np.float64)
+        self.nu_anom_grid = np.zeros((geom.Nr,geom.Nz)).astype(np.float64)
         self.nu_e_grid = np.zeros((geom.Nr,geom.Nz)).astype(np.float64)
 
         self.sigma_P_grid = np.zeros((geom.Nr,geom.Nz)).astype(np.float64)
@@ -108,7 +109,7 @@ class ElectronFluidContainer:
         self.kappa_perp_grid[:, :]     = kappa_perp
 
     def set_electron_collision_frequencies(
-        self, nn_grid, lnLambda=10.0, sigma_en_m2=5e-20, Te_is_eV=False
+        self, nn_grid, lnLambda=12.0, sigma_en_m2=2.0e-19, geom=None, J_mag=None, Ti=None, mi=None, include_anomalous=False, Te_is_eV=False
     ):
         """
         Compute and set electron collision frequencies:
@@ -117,14 +118,26 @@ class ElectronFluidContainer:
           - self.nu_e  : total = nu_en + nu_ei
         """
         nu_en_grid, nu_ei_grid, nu_e_grid = electron_fluid_helper.electron_collision_frequencies(
-            self.Te_grid, self.ne_grid, nn_grid, lnLambda=lnLambda, sigma_en_m2=sigma_en_m2, Te_is_eV=Te_is_eV
+            self.Te_grid,
+            self.ne_grid,
+            nn_grid,
+            lnLambda=lnLambda, sigma_en_m2=sigma_en_m2,
+            Te_is_eV=Te_is_eV
         )
         self.nu_en_grid[:] = nu_en_grid
         self.nu_ei_grid[:] = nu_ei_grid
+
+        if include_anomalous:
+            nu_anom_grid = electron_fluid_helper.get_anomalous_collision_frequency(
+                self.ne_grid, self.Te_grid, Ti, J_mag, mi
+            )
+            nu_e_grid[geom.mask==1] += nu_anom_grid[geom.mask==1]
+            self.nu_anom_grid[geom.mask==1] = nu_anom_grid[geom.mask==1]
+
         self.nu_e_grid[:]  = nu_e_grid
 
     def set_electron_conductivities(
-        self, hybrid_pic, lnLambda=10.0, sigma_en_m2=5e-20, Te_is_eV=False
+        self, hybrid_pic, lnLambda=12.0, Te_is_eV=False
     ):
         """
         Compute and set electron conductivity tensor components:
@@ -134,7 +147,7 @@ class ElectronFluidContainer:
         Bmag_grid = hybrid_pic.Bmag_grid
 
         sigma_par_e, sigma_P_e, sigma_H_e, _beta_e = electron_fluid_helper.electron_conductivities(
-            self.Te_grid, self.ne_grid, Bmag_grid, self.nu_e_grid, lnLambda=lnLambda, sigma_en_m2=sigma_en_m2, Te_is_eV=Te_is_eV
+            self.Te_grid, self.ne_grid, Bmag_grid, self.nu_e_grid, self.nu_anom_grid
         )
         self.sigma_parallel_grid[:] = sigma_par_e
         self.sigma_P_grid[:]        = sigma_P_e
@@ -176,7 +189,7 @@ class ElectronFluidContainer:
                 hybrid_pic.br_grid, hybrid_pic.bz_grid,
                 self.kappa_parallel_grid, self.kappa_perp_grid,
                 hybrid_pic.Jer_grid, hybrid_pic.Jez_grid,
-                geom.mask, dt_local
+                geom.mask, dt_local, particle_container.m
             )
             self.Te_grid[:, :] = Te_new
 
@@ -265,15 +278,9 @@ class ElectronFluidContainer:
 
 
     def apply_boundary_conditions(self):
-        """
-        Update this!
-        Add proper BCs for cathode and anode based on sheath physics
-        Use geometry object and update with 
-        """
+        
         # Axis of symmetry (r=0): dTe/dr = 0
         self.Te_grid[0, :] = self.Te_grid[1, :]
 
-        # Outer walls: zero-flux
-        self.Te_grid[-1, :] = self.Te_grid[-2, :]
-        self.Te_grid[:, 0] = self.Te_grid[:, 1]
-        self.Te_grid[:, -1] = self.Te_grid[:, -2]
+        # zero flux at symmetry plane
+        self.Te_grid[:, -1] = self.Te_grid[:, -2] # Neumann BC at z = zmax
