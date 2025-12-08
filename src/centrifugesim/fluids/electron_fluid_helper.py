@@ -20,12 +20,60 @@ def _kBT(Te, Te_is_eV):
     else:
         return Te * constants.kb
 
+@njit(nogil=True)
+def get_anomalous_collision_frequency(ne, Te, Ti, J_mag, mi):
+    """
+    Compute anomalous electron collision frequency (1/s) due to ion-acoustic
+    instability, using Bychenkov-Silin approximate scaling.
+    Inputs are arrays Te [K], Ti [K], ne [m^-3], J_mag [A/m^2] with identical shapes.
+    Ion mass mi [kg] is a scalar.
+    """
+    qe = constants.q_e
+    me = constants.m_e
+
+    # Calculate Drift Velocity
+    v_drift = J_mag / (ne * qe)
+
+    # Calculate Thermal/Sound Speeds
+    # v_th_e = sqrt(2*Te/me)
+    # c_s = sqrt(Te/mi)
+    v_th_e = np.sqrt(2.0 * constants.kb * Te / me)
+    c_s    = np.sqrt(constants.kb * Te / mi)
+
+    # Calculate Plasma Frequency
+    w_pe = np.sqrt(ne * qe**2 / (me * constants.ep0))
+
+    # Temperature Ratio (The "Gain" knob)
+    # Real physics: scales with Te/Ti.
+    # Safety: Clamp Ti_eff to at least 0.1 eV to prevent Te/Ti -> Infinity
+    Ti_eff = np.where(Ti < 0.1*11604, 0.1*11604, Ti)
+    Tratio = Te / Ti_eff
+    
+    # Bychenkov-Silin Scaling (Approximate)
+    # This roughly matches the kinetic theory limit without free parameters
+    # Factor ~ 0.01 comes from Sagdeev saturation theory
+    alpha_eff = 1.0e-2 * (Tratio) * (v_drift / v_th_e)
+    
+    nu_anom = alpha_eff * w_pe
+    
+    # Buneman Limit (Safety Cap)
+    # If v_drift is HUGE (> v_th_e), the instability changes to Buneman.
+    # The growth rate saturates at roughly (me/mi)^(1/3) * w_pe.
+    # This prevents the term from going to infinity if density drops to zero.
+    nu_max = 0.1 * w_pe
+
+    # Threshold Check: Ion Acoustic Instability
+    # Only active if electrons move faster than the acoustic wave
+    #nu_anom = np.where(v_drift > c_s, nu_anom, 0.0)
+    
+    return np.minimum(nu_anom, nu_max)
+
 
 @njit(cache=True)
 def electron_collision_frequencies(
     Te, ne, nn,
-    lnLambda=10.0,
-    sigma_en_m2=3e-19, # momentum transfer cross section, should have integral of cross section and distribution function and save it (interpolate) to then use here.
+    lnLambda=12.0,
+    sigma_en_m2=2.0e-19, # momentum transfer cross section, should have integral of cross section and distribution function and save it (interpolate) to then use here.
     Te_is_eV=False
 ):
     """
@@ -56,10 +104,7 @@ def electron_collision_frequencies(
 
 @njit(cache=True)
 def electron_conductivities(
-    Te, ne, Bmag, nu_e,
-    lnLambda=10.0,
-    sigma_en_m2=3e-19, # momentum transfer cross section, should have integral of cross section and distribution function and save it (interpolate) to then use here.
-    Te_is_eV=False
+    Te, ne, Bmag, nu_e, nu_e_anom
 ):
     """
     Electron conductivity tensor components (SI, S/m):
@@ -80,416 +125,263 @@ def electron_conductivities(
     pref = ne * (constants.q_e * constants.q_e) / constants.m_e  # S·s/m
 
     # Components (electrons only)
-    sigma_par_e = pref / nu_e
+    sigma_par_e = pref / (nu_e-nu_e_anom)  # subtract anomalous collision freq
     denom = (nu_e*nu_e + Omega_e*Omega_e)
     sigma_P_e = pref * (nu_e / denom)
     sigma_H_e = - pref * (Omega_e / denom)
 
     return sigma_par_e, sigma_P_e, sigma_H_e, Omega_e/nu_e  # β_e
 
-# Update solver !
-@numba.jit(nopython=True, parallel=True, nogil=True)
-def solve_step_prev(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
-               br, bz, kappa_parallel, kappa_perp,
-               Jer, Jez,
-               mask, dt):
-    """
-    Advances electron temperature one explicit step with anisotropic conduction,
-    but with *no* heat flux across faces that touch masked cells (mask==0)
-    or the outer domain boundary. This prevents sinks at electrodes/boundaries.
 
-    All arrays are shape (NR, NZ). mask is int8 with 1=solve region, 0=masked.
-    Explicit Euler for now just for testing, do not use for production runs.
-    TO DO:
-        Change to Douglas-ADI to get unconditionally stable behavior and larger timestep size.
+@numba.jit(nopython=True, parallel=True, nogil=True)
+def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
+                        br, bz, kappa_parallel, kappa_perp,
+                        Jer, Jez,
+                        mask, dt, ion_mass):
+    """
+    Advances electron temperature with PHYSICAL boundaries at nodes 0 and N-1.
+    
+    BOUNDARIES IMPLEMENTED:
+    - i = 0      : Axis Symmetry (No Flux)
+    - i = NR-1   : Outer Wall (Sheath Energy Loss)
+    - j = 0      : Bottom Wall (Sheath Energy Loss)
+    - j = NZ-1   : Top Symmetry (No Flux)
     """
     NR, NZ = Te.shape
+    
+    # Map constants from your module, or define locally for safety in Numba
+    # (Ensure these match your global constants module)
     kb = constants.kb
     qe = constants.q_e
-
-    # ---- user-settable electron 'inflow' temperature from masked regions (e.g., electrode)
-    #      If you know the electron temperature of the source feeding the masked region, set it here.
-    #      Using 0.0 prevents spurious energy injection when electrons enter from masked cells.
-    T_in_mask = 0.0
+    
+    # Sheath Transmission Factor (Energy lost per ion leaving)
+    # Delta ~ 6.0 accounts for thermal energy + sheath potential + presheath
+    delta_sheath = 6.0 
 
     alpha = 2.5 * kb / qe
 
-    for i in numba.prange(1, NR - 1):
-        for j in range(1, NZ - 1):
+    # ITERATE OVER ALL NODES (0 to N-1)
+    for i in numba.prange(0, NR):
+        for j in range(0, NZ):
 
+            # Skip masked cells or vacuum
             if not (mask[i, j] == 1 and n_e[i, j] > 0.0):
-                # Leave Te_new untouched for masked/vacuum cells
                 continue
 
             # =========================
-            # Conduction
+            # 1. Conduction & BC Fluxes
             # =========================
 
-            # --- Right face (i+1/2, j) ---
+            # --- Right face (i+1/2) ---
             qr_rh = 0.0
-            if i < NR - 1 and mask[i+1, j] == 1:
-                # Ensure the cross-term stencil does not sample masked cells
-                if (mask[i, j+1] == 1 and mask[i, j-1] == 1 and
-                    mask[i+1, j+1] == 1 and mask[i+1, j-1] == 1):
+            
+            # CASE A: Internal or Symmetry Interface
+            if i < NR - 1:
+                if mask[i+1, j] == 1:
+                    # Check cross-stencil availability
+                    if (j < NZ-1 and j > 0 and 
+                        mask[i, j+1] == 1 and mask[i, j-1] == 1 and
+                        mask[i+1, j+1] == 1 and mask[i+1, j-1] == 1):
 
-                    br_rh = 0.5 * (br[i, j] + br[i+1, j])
-                    bz_rh = 0.5 * (bz[i, j] + bz[i+1, j])
-                    k_par_rh = 0.5 * (kappa_parallel[i, j] + kappa_parallel[i+1, j])
-                    k_perp_rh = 0.5 * (kappa_perp[i, j] + kappa_perp[i+1, j])
-                    k_a_rh = k_par_rh - k_perp_rh
-                    k_rr_rh = k_perp_rh + k_a_rh * br_rh * br_rh
-                    k_rz_rh = k_a_rh * br_rh * bz_rh
-                    dT_dr_rh = (Te[i+1, j] - Te[i, j]) / dr
-                    dT_dz_rh = (Te[i, j+1] - Te[i, j-1] + Te[i+1, j+1] - Te[i+1, j-1]) / (4.0 * dz)
-                    qr_rh = -(k_rr_rh * dT_dr_rh + k_rz_rh * dT_dz_rh)
-                # else: face touches masked cells via cross-stencil → enforce qr_rh = 0
+                        # Full Anisotropic Stencil
+                        br_rh = 0.5 * (br[i, j] + br[i+1, j])
+                        bz_rh = 0.5 * (bz[i, j] + bz[i+1, j])
+                        k_par_rh = 0.5 * (kappa_parallel[i, j] + kappa_parallel[i+1, j])
+                        k_perp_rh = 0.5 * (kappa_perp[i, j] + kappa_perp[i+1, j])
+                        k_a_rh = k_par_rh - k_perp_rh
+                        k_rr_rh = k_perp_rh + k_a_rh * br_rh * br_rh
+                        k_rz_rh = k_a_rh * br_rh * bz_rh
+                        dT_dr_rh = (Te[i+1, j] - Te[i, j]) / dr
+                        dT_dz_rh = (Te[i, j+1] - Te[i, j-1] + Te[i+1, j+1] - Te[i+1, j-1]) / (4.0 * dz)
+                        qr_rh = -(k_rr_rh * dT_dr_rh + k_rz_rh * dT_dz_rh)
+                    else:
+                        # Fallback for complex mask edges: Simple isotropic gradient
+                        k_eff = 0.5 * (kappa_perp[i, j] + kappa_perp[i+1, j])
+                        qr_rh = -k_eff * (Te[i+1, j] - Te[i, j]) / dr
+            
+            # CASE B: Outer Physical Wall (r = rmax)
+            else: 
+                # Energy LEAVES domain (+r direction)
+                cs = np.sqrt((kb * Te[i, j]) / ion_mass)
+                qr_rh = delta_sheath * n_e[i, j] * cs * (kb * Te[i, j])
 
-            # --- Left face (i-1/2, j) ---
+            # --- Left face (i-1/2) ---
             qr_lh = 0.0
-            # Symmetry at axis: enforce zero-flux at the inner boundary
-            if i > 1 and mask[i-1, j] == 1:
-                if (mask[i, j+1] == 1 and mask[i, j-1] == 1 and
-                    mask[i-1, j+1] == 1 and mask[i-1, j-1] == 1):
+            
+            # CASE A: Internal Interface
+            if i > 0:
+                if mask[i-1, j] == 1:
+                    # (Simplified logic for brevity, matches structure above)
+                    if (j < NZ-1 and j > 0 and
+                        mask[i, j+1] == 1 and mask[i, j-1] == 1 and
+                        mask[i-1, j+1] == 1 and mask[i-1, j-1] == 1):
+                        
+                        br_lh = 0.5 * (br[i, j] + br[i-1, j])
+                        bz_lh = 0.5 * (bz[i, j] + bz[i-1, j])
+                        k_par_lh = 0.5 * (kappa_parallel[i, j] + kappa_parallel[i-1, j])
+                        k_perp_lh = 0.5 * (kappa_perp[i, j] + kappa_perp[i-1, j])
+                        k_a_lh = k_par_lh - k_perp_lh
+                        k_rr_lh = k_perp_lh + k_a_lh * br_lh * br_lh
+                        k_rz_lh = k_a_lh * br_lh * bz_lh
+                        dT_dr_lh = (Te[i, j] - Te[i-1, j]) / dr
+                        dT_dz_lh = (Te[i, j+1] - Te[i, j-1] + Te[i-1, j+1] - Te[i-1, j-1]) / (4.0 * dz)
+                        qr_lh = -(k_rr_lh * dT_dr_lh + k_rz_lh * dT_dz_lh)
+                    else:
+                        k_eff = 0.5 * (kappa_perp[i, j] + kappa_perp[i-1, j])
+                        qr_lh = -k_eff * (Te[i, j] - Te[i-1, j]) / dr
+            
+            # CASE B: Axis of Symmetry (r = 0)
+            else:
+                qr_lh = 0.0
 
-                    br_lh = 0.5 * (br[i, j] + br[i-1, j])
-                    bz_lh = 0.5 * (bz[i, j] + bz[i-1, j])
-                    k_par_lh = 0.5 * (kappa_parallel[i, j] + kappa_parallel[i-1, j])
-                    k_perp_lh = 0.5 * (kappa_perp[i, j] + kappa_perp[i-1, j])
-                    k_a_lh = k_par_lh - k_perp_lh
-                    k_rr_lh = k_perp_lh + k_a_lh * br_lh * br_lh
-                    k_rz_lh = k_a_lh * br_lh * bz_lh
-                    dT_dr_lh = (Te[i, j] - Te[i-1, j]) / dr
-                    dT_dz_lh = (Te[i, j+1] - Te[i, j-1] + Te[i-1, j+1] - Te[i-1, j-1]) / (4.0 * dz)
-                    qr_lh = -(k_rr_lh * dT_dr_lh + k_rz_lh * dT_dz_lh)
-                # else: face touches masked cells via cross-stencil → enforce qr_lh = 0
-            # If i == 1, we are at the first active ring next to the axis: keep qr_lh = 0
-
-            # --- Top face (i, j+1/2) ---
+            # --- Top face (j+1/2) ---
             qz_th = 0.0
-            if j < NZ - 1 and mask[i, j+1] == 1:
-                if (mask[i+1, j] == 1 and mask[i-1, j] == 1 and
-                    mask[i+1, j+1] == 1 and mask[i-1, j+1] == 1):
+            
+            # CASE A: Internal Interface
+            if j < NZ - 1:
+                if mask[i, j+1] == 1:
+                    if (i < NR-1 and i > 0 and
+                        mask[i+1, j] == 1 and mask[i-1, j] == 1 and
+                        mask[i+1, j+1] == 1 and mask[i-1, j+1] == 1):
 
-                    br_th = 0.5 * (br[i, j] + br[i, j+1])
-                    bz_th = 0.5 * (bz[i, j] + bz[i, j+1])
-                    k_par_th = 0.5 * (kappa_parallel[i, j] + kappa_parallel[i, j+1])
-                    k_perp_th = 0.5 * (kappa_perp[i, j] + kappa_perp[i, j+1])
-                    k_a_th = k_par_th - k_perp_th
-                    k_zz_th = k_perp_th + k_a_th * bz_th * bz_th
-                    k_rz_th = k_a_th * br_th * bz_th
-                    dT_dz_th = (Te[i, j+1] - Te[i, j]) / dz
-                    dT_dr_th = (Te[i+1, j] - Te[i-1, j] + Te[i+1, j+1] - Te[i-1, j+1]) / (4.0 * dr)
-                    qz_th = -(k_rz_th * dT_dr_th + k_zz_th * dT_dz_th)
-                # else: face touches masked cells via cross-stencil → enforce qz_th = 0
+                        br_th = 0.5 * (br[i, j] + br[i, j+1])
+                        bz_th = 0.5 * (bz[i, j] + bz[i, j+1])
+                        k_par_th = 0.5 * (kappa_parallel[i, j] + kappa_parallel[i, j+1])
+                        k_perp_th = 0.5 * (kappa_perp[i, j] + kappa_perp[i, j+1])
+                        k_a_th = k_par_th - k_perp_th
+                        k_zz_th = k_perp_th + k_a_th * bz_th * bz_th
+                        k_rz_th = k_a_th * br_th * bz_th
+                        dT_dz_th = (Te[i, j+1] - Te[i, j]) / dz
+                        dT_dr_th = (Te[i+1, j] - Te[i-1, j] + Te[i+1, j+1] - Te[i-1, j+1]) / (4.0 * dr)
+                        qz_th = -(k_rz_th * dT_dr_th + k_zz_th * dT_dz_th)
+                    else:
+                        k_eff = 0.5 * (kappa_perp[i, j] + kappa_perp[i, j+1])
+                        qz_th = -k_eff * (Te[i, j+1] - Te[i, j]) / dz
+            
+            # CASE B: Top Symmetry Plane (z = zmax)
+            else:
+                qz_th = 0.0
 
-            # --- Bottom face (i, j-1/2) ---
+            # --- Bottom face (j-1/2) ---
             qz_bh = 0.0
-            if j > 1 and mask[i, j-1] == 1:
-                if (mask[i+1, j] == 1 and mask[i-1, j] == 1 and
-                    mask[i+1, j-1] == 1 and mask[i-1, j-1] == 1):
+            
+            # CASE A: Internal Interface
+            if j > 0:
+                if mask[i, j-1] == 1:
+                    if (i < NR-1 and i > 0 and
+                        mask[i+1, j] == 1 and mask[i-1, j] == 1 and
+                        mask[i+1, j-1] == 1 and mask[i-1, j-1] == 1):
 
-                    br_bh = 0.5 * (br[i, j] + br[i, j-1])
-                    bz_bh = 0.5 * (bz[i, j] + bz[i, j-1])
-                    k_par_bh = 0.5 * (kappa_parallel[i, j] + kappa_parallel[i, j-1])
-                    k_perp_bh = 0.5 * (kappa_perp[i, j] + kappa_perp[i, j-1])
-                    k_a_bh = k_par_bh - k_perp_bh
-                    k_zz_bh = k_perp_bh + k_a_bh * bz_bh * bz_bh
-                    k_rz_bh = k_a_bh * br_bh * bz_bh
-                    dT_dz_bh = (Te[i, j] - Te[i, j-1]) / dz
-                    dT_dr_bh = (Te[i+1, j] - Te[i-1, j] + Te[i+1, j-1] - Te[i-1, j-1]) / (4.0 * dr)
-                    qz_bh = -(k_rz_bh * dT_dr_bh + k_zz_bh * dT_dz_bh)
-                # else: face touches masked cells via cross-stencil → enforce qz_bh = 0
-            # If j == 1, we’re at the first active row next to z-min: keep qz_bh = 0
+                        br_bh = 0.5 * (br[i, j] + br[i, j-1])
+                        bz_bh = 0.5 * (bz[i, j] + bz[i, j-1])
+                        k_par_bh = 0.5 * (kappa_parallel[i, j] + kappa_parallel[i, j-1])
+                        k_perp_bh = 0.5 * (kappa_perp[i, j] + kappa_perp[i, j-1])
+                        k_a_bh = k_par_bh - k_perp_bh
+                        k_zz_bh = k_perp_bh + k_a_bh * bz_bh * bz_bh
+                        k_rz_bh = k_a_bh * br_bh * bz_bh
+                        dT_dz_bh = (Te[i, j] - Te[i, j-1]) / dz
+                        dT_dr_bh = (Te[i+1, j] - Te[i-1, j] + Te[i+1, j-1] - Te[i-1, j-1]) / (4.0 * dr)
+                        qz_bh = -(k_rz_bh * dT_dr_bh + k_zz_bh * dT_dz_bh)
+                    else:
+                        k_eff = 0.5 * (kappa_perp[i, j] + kappa_perp[i, j-1])
+                        qz_bh = -k_eff * (Te[i, j] - Te[i, j-1]) / dz
+            
+            # CASE B: Bottom Physical Wall (z = zmin)
+            else:
+                # Energy LEAVES domain (-z direction)
+                cs = np.sqrt((kb * Te[i, j]) / ion_mass)
+                # Flux is NEGATIVE because it is in -z direction
+                qz_bh = -delta_sheath * n_e[i, j] * cs * (kb * Te[i, j])
 
-            # --- Divergence (finite-volume consistent in RZ) ---
+
+            # --- Divergence ---
             r_center = r_vec[i] + 1e-12
             r_rh_face = r_vec[i] + 0.5 * dr
             r_lh_face = r_vec[i] - 0.5 * dr
+            
+            # Handle r=0 geometry carefully
+            term_r = 0.0
+            if i == 0:
+                # Left area is 0, so r_lh_face * qr_lh is 0
+                term_r = (r_rh_face * qr_rh) / (r_center * dr)
+            else:
+                term_r = (r_rh_face * qr_rh - r_lh_face * qr_lh) / (r_center * dr)
+                
+            div_q = term_r + (qz_th - qz_bh) / dz
 
-            div_qr_term = (r_rh_face * qr_rh - r_lh_face * qr_lh) / (r_center * dr)
-            div_qz_term = (qz_th - qz_bh) / dz
-            div_q = div_qr_term + div_qz_term
 
             # =========================
-            # Advection (electron enthalpy)
+            # 2. Advection
             # =========================
+            
+            # At physical boundaries (i=NR-1 and j=0), the Sheath Loss (delta ~ 6.0)
+            # already includes the enthalpy flux of lost particles. 
+            # We set F_adv = 0 at those specific faces to avoid double counting.
 
-            # Right face i+1/2
+            # Right face (i+1/2)
             F_r_rh = 0.0
             if i < NR - 1:
                 if mask[i+1, j] == 1:
                     Jr_face = 0.5 * (Jer[i, j] + Jer[i+1, j])
-                    # Electrons move opposite to J
-                    if Jr_face > 0.0:
-                        # electrons from right -> left
-                        T_up = Te[i+1, j]
-                    else:
-                        # electrons from left -> right
-                        T_up = Te[i, j]
+                    T_up = Te[i+1, j] if Jr_face > 0.0 else Te[i, j]
+                    F_r_rh = -alpha * T_up * Jr_face
                 else:
-                    # boundary/masked neighbor: one-sided flux with zero-gradient T
-                    Jr_face = Jer[i, j]
-                    T_up = Te[i, j]
-                F_r_rh = -alpha * T_up * Jr_face
+                    F_r_rh = -alpha * Te[i, j] * Jer[i, j]
+            else:
+                # Wall Boundary: Sheath term handles energy loss
+                F_r_rh = 0.0
 
-            # Left face i-1/2
+            # Left face (i-1/2)
             F_r_lh = 0.0
-            if i > 1:
+            if i > 0:
                 if mask[i-1, j] == 1:
                     Jr_face = 0.5 * (Jer[i, j] + Jer[i-1, j])
-                    if Jr_face > 0.0:
-                        # electrons from right (i) -> left (i-1)
-                        T_up = Te[i, j]
-                    else:
-                        # electrons from left (i-1) -> right (i)
-                        T_up = Te[i-1, j]
+                    T_up = Te[i, j] if Jr_face > 0.0 else Te[i-1, j]
+                    F_r_lh = -alpha * T_up * Jr_face
                 else:
-                    Jr_face = Jer[i, j]
-                    T_up = Te[i, j]
-                F_r_lh = -alpha * T_up * Jr_face
-            # axis i==1: keep F_r_lh = 0
+                    F_r_lh = -alpha * Te[i, j] * Jer[i, j]
+            else:
+                # Axis Symmetry
+                F_r_lh = 0.0
 
-            # Top face j+1/2
+            # Top face (j+1/2)
             F_z_th = 0.0
             if j < NZ - 1:
                 if mask[i, j+1] == 1:
                     Jz_face = 0.5 * (Jez[i, j] + Jez[i, j+1])
-                    if Jz_face > 0.0:
-                        # electrons from top (j+1) -> bottom (j)
-                        T_up = Te[i, j+1]
-                    else:
-                        # electrons from bottom (j) -> top (j+1)
-                        T_up = Te[i, j]
+                    T_up = Te[i, j+1] if Jz_face > 0.0 else Te[i, j]
+                    F_z_th = -alpha * T_up * Jz_face
                 else:
-                    Jz_face = Jez[i, j]
-                    T_up = Te[i, j]
-                F_z_th = -alpha * T_up * Jz_face
+                    F_z_th = -alpha * Te[i, j] * Jez[i, j]
+            else:
+                # Symmetry
+                F_z_th = 0.0
 
-            # Bottom face j-1/2
+            # Bottom face (j-1/2)
             F_z_bh = 0.0
-            if j > 1:
+            if j > 0:
                 if mask[i, j-1] == 1:
                     Jz_face = 0.5 * (Jez[i, j] + Jez[i, j-1])
-                    if Jz_face > 0.0:
-                        # electrons from j -> j-1
-                        T_up = Te[i, j]
-                    else:
-                        # electrons from j-1 -> j
-                        T_up = Te[i, j-1]
+                    T_up = Te[i, j] if Jz_face > 0.0 else Te[i, j-1]
+                    F_z_bh = -alpha * T_up * Jz_face
                 else:
-                    Jz_face = Jez[i, j]
-                    T_up = Te[i, j]
-                F_z_bh = -alpha * T_up * Jz_face
-            # j==1: keep F_z_bh = 0
+                    F_z_bh = -alpha * Te[i, j] * Jez[i, j]
+            else:
+                # Wall Boundary: Sheath term handles energy loss
+                F_z_bh = 0.0
 
-            # Divergence of advective enthalpy flux in RZ
-            div_Fadv = (r_rh_face * F_r_rh - r_lh_face * F_r_lh) / (r_center * dr) + (F_z_th - F_z_bh) / dz
-          
+            # Advection Divergence
+            term_adv_r = 0.0
+            if i == 0:
+                term_adv_r = (r_rh_face * F_r_rh) / (r_center * dr)
+            else:
+                term_adv_r = (r_rh_face * F_r_rh - r_lh_face * F_r_lh) / (r_center * dr)
+                
+            div_Fadv = term_adv_r + (F_z_th - F_z_bh) / dz
+            
             # =========================
-            # Update
+            # 3. Update
             # =========================
-            #rhs = -div_q - div_Fadv + Q_Joule[i, j]
-            rhs = -div_q + Q_Joule[i, j]
+            rhs = -div_q - div_Fadv + Q_Joule[i, j]
             dTe_dt = (2.0 / (3.0 * n_e[i, j] * kb)) * rhs
-            Te_new[i, j] = Te[i, j] + dt * dTe_dt
-
-
-@numba.jit(nopython=True, parallel=True, nogil=True)
-def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
-               br, bz, kappa_parallel, kappa_perp,
-               Jer, Jez,
-               mask, dt):
-    """
-    Advances electron temperature with Anisotropic Conduction + Boundary Convection.
-    
-    Includes 'Enthalpy Flux' cooling at electrodes (Anode/Cathode) to prevent
-    overheating in the sheath.
-    """
-    NR, NZ = Te.shape
-    kb = constants.kb
-    qe = constants.q_e
-
-    # Enthalpy coefficient: 2.5 * kB / e
-    # Flux Q = 2.5 * kB * T * Gamma_e = 2.5 * kB * T * (Je / -e)
-    # Q = - (2.5 * kB/e) * T * Je
-    alpha = 2.5 * kb / qe
-    
-    # Assume wall emission temperature (approx 1-2 eV) for inflow
-    T_wall_K = 2000.0 
-
-    for i in numba.prange(1, NR - 1):
-        for j in range(1, NZ - 1):
-
-            # Skip solid/vacuum cells
-            if not (mask[i, j] == 1 and n_e[i, j] > 0.0):
-                continue
-
-            # =========================
-            # 1. Radial Fluxes (qr)
-            # =========================
-
-            # --- Right face (i+1/2, j) ---
-            qr_rh = 0.0
-            
-            # A. Internal Conduction (Plasma to Plasma)
-            if i < NR - 1 and mask[i+1, j] == 1:
-                # Only conduct if 4-point stencil is valid (simplified check)
-                # You can relax this to 2-point if needed, but keeping your original logic:
-                if (mask[i, j+1] and mask[i, j-1] and mask[i+1, j+1] and mask[i+1, j-1]):
-                    
-                    br_rh = 0.5 * (br[i, j] + br[i+1, j])
-                    bz_rh = 0.5 * (bz[i, j] + bz[i+1, j])
-                    k_par = 0.5 * (kappa_parallel[i, j] + kappa_parallel[i+1, j])
-                    k_per = 0.5 * (kappa_perp[i, j] + kappa_perp[i+1, j])
-                    
-                    k_rr = k_per + (k_par - k_per) * br_rh * br_rh
-                    k_rz = (k_par - k_per) * br_rh * bz_rh
-                    
-                    dT_dr = (Te[i+1, j] - Te[i, j]) / dr
-                    dT_dz = (Te[i, j+1] - Te[i, j-1] + Te[i+1, j+1] - Te[i+1, j-1]) / (4.0 * dz)
-                    
-                    qr_rh = -(k_rr * dT_dr + k_rz * dT_dz)
-            
-            # B. Boundary Convection (Plasma to Wall)
-            elif i < NR - 1 and mask[i+1, j] == 0:
-                # We are at the Right edge of plasma. Wall is at i+1.
-                # Normal vector n = +r.
-                
-                J_face = Jer[i, j] # Use cell center approximation for boundary face
-                
-                # Logic:
-                # If Jer < 0: Electrons moving Right (+r). Outflow to wall. COOLING.
-                # If Jer > 0: Electrons moving Left (-r). Inflow from wall. HEATING.
-                
-                if J_face < 0.0:
-                    T_flux = Te[i, j]   # Carry bulk heat out
-                else:
-                    T_flux = T_wall_K   # Bring cold electrons in
-                
-                qr_rh = -alpha * T_flux * J_face
-
-            # --- Left face (i-1/2, j) ---
-            qr_lh = 0.0
-            
-            # A. Internal Conduction
-            if i > 1 and mask[i-1, j] == 1:
-                if (mask[i, j+1] and mask[i, j-1] and mask[i-1, j+1] and mask[i-1, j-1]):
-                    
-                    br_lh = 0.5 * (br[i, j] + br[i-1, j])
-                    bz_lh = 0.5 * (bz[i, j] + bz[i-1, j])
-                    k_par = 0.5 * (kappa_parallel[i, j] + kappa_parallel[i-1, j])
-                    k_per = 0.5 * (kappa_perp[i, j] + kappa_perp[i-1, j])
-                    
-                    k_rr = k_per + (k_par - k_per) * br_lh * br_lh
-                    k_rz = (k_par - k_per) * br_lh * bz_lh
-                    
-                    dT_dr = (Te[i, j] - Te[i-1, j]) / dr
-                    dT_dz = (Te[i, j+1] - Te[i, j-1] + Te[i-1, j+1] - Te[i-1, j-1]) / (4.0 * dz)
-                    
-                    qr_lh = -(k_rr * dT_dr + k_rz * dT_dz)
-            
-            # B. Boundary Convection (Plasma to Wall)
-            elif i > 0 and mask[i-1, j] == 0:
-                # We are at Left edge of plasma. Wall is at i-1.
-                # Normal vector is -r (looking from wall)? 
-                # No, qr_lh is flux across i-1/2 in +r direction.
-                
-                J_face = Jer[i, j]
-                
-                # Logic for qr_lh (Flux across left face in +r direction):
-                # If Jer > 0: Electrons moving Left (-r) (Out of plasma into Left Wall).
-                #    This is Outflow. We lose heat. Flux must be Negative (Leaving i).
-                #    Formula: -alpha * T * (+J) = Negative. Correct.
-                
-                if J_face > 0.0:
-                    T_flux = Te[i, j] # Outflow to left wall
-                else:
-                    T_flux = T_wall_K # Inflow from left wall
-                
-                qr_lh = -alpha * T_flux * J_face
-
-
-            # =========================
-            # 2. Axial Fluxes (qz)
-            # =========================
-
-            # --- Top face (i, j+1/2) ---
-            qz_th = 0.0
-            
-            if j < NZ - 1 and mask[i, j+1] == 1:
-                # Internal Conduction
-                if (mask[i+1, j] and mask[i-1, j] and mask[i+1, j+1] and mask[i-1, j+1]):
-                    bz_th = 0.5 * (bz[i, j] + bz[i, j+1])
-                    br_th = 0.5 * (br[i, j] + br[i, j+1])
-                    k_par = 0.5 * (kappa_parallel[i, j] + kappa_parallel[i, j+1])
-                    k_per = 0.5 * (kappa_perp[i, j] + kappa_perp[i, j+1])
-                    
-                    k_zz = k_per + (k_par - k_per) * bz_th * bz_th
-                    k_rz = (k_par - k_per) * br_th * bz_th
-                    
-                    dT_dz = (Te[i, j+1] - Te[i, j]) / dz
-                    dT_dr = (Te[i+1, j] - Te[i-1, j] + Te[i+1, j+1] - Te[i-1, j+1]) / (4.0 * dr)
-                    
-                    qz_th = -(k_rz * dT_dr + k_zz * dT_dz)
-            
-            elif j < NZ - 1 and mask[i, j+1] == 0:
-                # Boundary Top
-                J_face = Jez[i, j]
-                # If J < 0: Electrons moving Up (+z). Outflow.
-                if J_face < 0.0:
-                    T_flux = Te[i, j]
-                else:
-                    T_flux = T_wall_K
-                qz_th = -alpha * T_flux * J_face
-
-            # --- Bottom face (i, j-1/2) ---
-            qz_bh = 0.0
-            
-            if j > 1 and mask[i, j-1] == 1:
-                # Internal Conduction
-                if (mask[i+1, j] and mask[i-1, j] and mask[i+1, j-1] and mask[i-1, j-1]):
-                    bz_bh = 0.5 * (bz[i, j] + bz[i, j-1])
-                    br_bh = 0.5 * (br[i, j] + br[i, j-1])
-                    k_par = 0.5 * (kappa_parallel[i, j] + kappa_parallel[i, j-1])
-                    k_per = 0.5 * (kappa_perp[i, j] + kappa_perp[i, j-1])
-                    
-                    k_zz = k_per + (k_par - k_per) * bz_bh * bz_bh
-                    k_rz = (k_par - k_per) * br_bh * bz_bh
-                    
-                    dT_dz = (Te[i, j] - Te[i, j-1]) / dz
-                    dT_dr = (Te[i+1, j] - Te[i-1, j] + Te[i+1, j-1] - Te[i-1, j-1]) / (4.0 * dr)
-                    
-                    qz_bh = -(k_rz * dT_dr + k_zz * dT_dz)
-            
-            elif j > 0 and mask[i, j-1] == 0:
-                # Boundary Bottom (e.g., Cathode Face)
-                J_face = Jez[i, j]
-                # If J > 0: Electrons moving Down (-z). Outflow.
-                # If J < 0: Electrons moving Up (+z). Inflow (from Cathode).
-                
-                if J_face > 0.0:
-                    T_flux = Te[i, j]   # Outflow
-                else:
-                    T_flux = T_wall_K   # Inflow (Cathode Emission is cold relative to bulk)
-                
-                qz_bh = -alpha * T_flux * J_face
-
-            # =========================
-            # 3. Divergence & Update
-            # =========================
-            
-            # RZ Divergence: (1/r) * d(r*qr)/dr
-            r_c = r_vec[i] + 1e-12
-            r_r = r_vec[i] + 0.5 * dr
-            r_l = r_vec[i] - 0.5 * dr
-
-            div_q = ((r_r * qr_rh - r_l * qr_lh) / (r_c * dr) + 
-                     (qz_th - qz_bh) / dz)
-           
-            rhs = -div_q + Q_Joule[i, j]
-            
-            # Update
-            # dTe/dt = (2/3n) * RHS
-            dTe_dt = (2.0 / (3.0 * n_e[i, j] * kb)) * rhs
-            
             Te_new[i, j] = Te[i, j] + dt * dTe_dt
