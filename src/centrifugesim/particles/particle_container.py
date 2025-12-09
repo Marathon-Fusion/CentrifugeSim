@@ -509,6 +509,9 @@ class ParticleContainer:
             self.vt[ind] += dvt_
             self.vz[ind] += dvz_
 
+            del R, dvr_, dvt_, dvz_, D_p, nu_drag_p
+            cp._default_memory_pool.free_all_blocks()
+            
     def reset_particles(self, geom, nppc):
         """
         This function removes all the ions in the domain and create new ones 
