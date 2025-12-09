@@ -611,6 +611,7 @@ class ParticleContainer:
 
         # 3. Gather to particle positions
         decay_factor_loc = self.gatherScalarField(decay_grid_d, geom.dr, geom.dz, geom.zmin)
+        decay_factor_loc = cp.minimum(decay_factor_loc, 1.0)
         
         # 4. Apply
         self.weight *= decay_factor_loc
