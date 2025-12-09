@@ -160,7 +160,8 @@ def initialize_ions_from_ni_w(ni, Ti, rmesh, zmesh, dr, dz, w, mi, rng=None):
     return w_p, r_p, z_p, vr_p, vt_p, vz_p
 
 
-def initialize_ions_from_ni_nppc(ni, Ti, rmesh, zmesh, dr, dz, nppc, mi, rng=None):
+def initialize_ions_from_ni_nppc(ni, Ti, rmesh, zmesh, dr, dz, nppc, mi,
+            uir=None, uit=None, uiz=None, rng=None):
     """
     Build macro-particle positions and velocities from nodal ion density/temperature
     fields on an r-z cylindrical mesh.
@@ -239,6 +240,13 @@ def initialize_ions_from_ni_nppc(ni, Ti, rmesh, zmesh, dr, dz, nppc, mi, rng=Non
             vr_p[offset:offset+n_here] = rng.normal(0.0, v_th, n_here)
             vt_p[offset:offset+n_here] = rng.normal(0.0, v_th, n_here)
             vz_p[offset:offset+n_here] = rng.normal(0.0, v_th, n_here)
+
+            if(uir is not None):
+                vr_p[offset:offset+n_here] += uir[i, j]
+            if(uit is not None):
+                vt_p[offset:offset+n_here] += uit[i, j]
+            if(uiz is not None):
+                vz_p[offset:offset+n_here] += uiz[i, j]
 
             # per-particle weight for this cell
             w_p[offset:offset+n_here] = w_cell[i, j]
