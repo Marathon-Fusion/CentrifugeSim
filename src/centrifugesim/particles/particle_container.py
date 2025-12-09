@@ -779,6 +779,7 @@ class ParticleContainer:
         m_n,
         dt,
         sigma_mt=5e-19,
+        include_thermal=True,
         seed=None
     ):
         """
@@ -839,9 +840,14 @@ class ParticleContainer:
         g3    = cp.random.randn(N, dtype=cp.float32)    # Gaussian for neutral thermal vz
 
         # Sample neutral velocity from drifting maxwellian
-        vnr = unr_loc + cp.sqrt((2.0 * constants.kb * Tn_loc) / m_n) * g1
-        vnt = unt_loc + cp.sqrt((2.0 * constants.kb * Tn_loc) / m_n) * g2
-        vnz = unz_loc + cp.sqrt((2.0 * constants.kb * Tn_loc) / m_n) * g3
+        if(include_thermal):
+            vnr = unr_loc + cp.sqrt((2.0 * constants.kb * Tn_loc) / m_n) * g1
+            vnt = unt_loc + cp.sqrt((2.0 * constants.kb * Tn_loc) / m_n) * g2
+            vnz = unz_loc + cp.sqrt((2.0 * constants.kb * Tn_loc) / m_n) * g3
+        else:
+            vnr = unr_loc
+            vnt = unt_loc
+            vnz = unz_loc
 
         # calculate umag
         udiff_r = self.vr - vnr

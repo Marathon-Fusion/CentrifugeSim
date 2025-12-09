@@ -135,38 +135,35 @@ def electron_conductivities(
 
 @numba.jit(nopython=True, parallel=True, nogil=True)
 def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
-                        br, bz, kappa_parallel, kappa_perp,
-                        Jer, Jez,
-                        mask, dt, ion_mass):
+               br, bz, kappa_parallel, kappa_perp,
+               Jer, Jez,
+               mask, dt, ion_mass):
     """
-    Advances electron temperature with PHYSICAL boundaries at nodes 0 and N-1.
-    
-    BOUNDARIES IMPLEMENTED:
-    - i = 0      : Axis Symmetry (No Flux)
-    - i = NR-1   : Outer Wall (Sheath Energy Loss)
-    - j = 0      : Bottom Wall (Sheath Energy Loss)
-    - j = NZ-1   : Top Symmetry (No Flux)
+    Advances electron temperature with PHYSICAL boundaries at external walls
+    AND internal masked objects (sheath loss).
     """
     NR, NZ = Te.shape
     
-    # Map constants from your module, or define locally for safety in Numba
-    # (Ensure these match your global constants module)
+    # Constants
     kb = constants.kb
     qe = constants.q_e
     
-    # Sheath Transmission Factor (Energy lost per ion leaving)
-    # Delta ~ 6.0 accounts for thermal energy + sheath potential + presheath
+    # Sheath Transmission Factor
     delta_sheath = 6.0 
-
     alpha = 2.5 * kb / qe
 
-    # ITERATE OVER ALL NODES (0 to N-1)
+    # ITERATE OVER ALL NODES
     for i in numba.prange(0, NR):
         for j in range(0, NZ):
 
             # Skip masked cells or vacuum
             if not (mask[i, j] == 1 and n_e[i, j] > 0.0):
                 continue
+
+            # Pre-calculate sound speed for this node (used for BCs)
+            # cs = sqrt(k Te / Mi)
+            cs_local = np.sqrt((kb * Te[i, j]) / ion_mass)
+            sheath_flux_mag = delta_sheath * n_e[i, j] * cs_local * (kb * Te[i, j])
 
             # =========================
             # 1. Conduction & BC Fluxes
@@ -178,12 +175,11 @@ def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
             # CASE A: Internal or Symmetry Interface
             if i < NR - 1:
                 if mask[i+1, j] == 1:
-                    # Check cross-stencil availability
+                    # EXISTING: Full Anisotropic Stencil checks
                     if (j < NZ-1 and j > 0 and 
                         mask[i, j+1] == 1 and mask[i, j-1] == 1 and
                         mask[i+1, j+1] == 1 and mask[i+1, j-1] == 1):
 
-                        # Full Anisotropic Stencil
                         br_rh = 0.5 * (br[i, j] + br[i+1, j])
                         bz_rh = 0.5 * (bz[i, j] + bz[i+1, j])
                         k_par_rh = 0.5 * (kappa_parallel[i, j] + kappa_parallel[i+1, j])
@@ -195,15 +191,18 @@ def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
                         dT_dz_rh = (Te[i, j+1] - Te[i, j-1] + Te[i+1, j+1] - Te[i+1, j-1]) / (4.0 * dz)
                         qr_rh = -(k_rr_rh * dT_dr_rh + k_rz_rh * dT_dz_rh)
                     else:
-                        # Fallback for complex mask edges: Simple isotropic gradient
+                        # Simple isotropic fallback for messy plasma-plasma edges
                         k_eff = 0.5 * (kappa_perp[i, j] + kappa_perp[i+1, j])
                         qr_rh = -k_eff * (Te[i+1, j] - Te[i, j]) / dr
+                
+                else: 
+                    # NEW: Neighbor is Masked (Solid). 
+                    # Flux is POSITIVE (leaves i towards i+1)
+                    qr_rh = sheath_flux_mag
             
             # CASE B: Outer Physical Wall (r = rmax)
             else: 
-                # Energy LEAVES domain (+r direction)
-                cs = np.sqrt((kb * Te[i, j]) / ion_mass)
-                qr_rh = delta_sheath * n_e[i, j] * cs * (kb * Te[i, j])
+                qr_rh = sheath_flux_mag
 
             # --- Left face (i-1/2) ---
             qr_lh = 0.0
@@ -211,7 +210,6 @@ def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
             # CASE A: Internal Interface
             if i > 0:
                 if mask[i-1, j] == 1:
-                    # (Simplified logic for brevity, matches structure above)
                     if (j < NZ-1 and j > 0 and
                         mask[i, j+1] == 1 and mask[i, j-1] == 1 and
                         mask[i-1, j+1] == 1 and mask[i-1, j-1] == 1):
@@ -229,6 +227,10 @@ def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
                     else:
                         k_eff = 0.5 * (kappa_perp[i, j] + kappa_perp[i-1, j])
                         qr_lh = -k_eff * (Te[i, j] - Te[i-1, j]) / dr
+                else:
+                    # NEW: Neighbor is Masked (Solid).
+                    # Flux is NEGATIVE (leaves i towards i-1)
+                    qr_lh = -sheath_flux_mag
             
             # CASE B: Axis of Symmetry (r = 0)
             else:
@@ -257,6 +259,10 @@ def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
                     else:
                         k_eff = 0.5 * (kappa_perp[i, j] + kappa_perp[i, j+1])
                         qz_th = -k_eff * (Te[i, j+1] - Te[i, j]) / dz
+                else:
+                    # NEW: Neighbor is Masked (Solid).
+                    # Flux is POSITIVE (leaves j towards j+1)
+                    qz_th = sheath_flux_mag
             
             # CASE B: Top Symmetry Plane (z = zmax)
             else:
@@ -285,13 +291,14 @@ def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
                     else:
                         k_eff = 0.5 * (kappa_perp[i, j] + kappa_perp[i, j-1])
                         qz_bh = -k_eff * (Te[i, j] - Te[i, j-1]) / dz
-            
+                else:
+                    # NEW: Neighbor is Masked (Solid).
+                    # Flux is NEGATIVE (leaves j towards j-1)
+                    qz_bh = -sheath_flux_mag
+
             # CASE B: Bottom Physical Wall (z = zmin)
             else:
-                # Energy LEAVES domain (-z direction)
-                cs = np.sqrt((kb * Te[i, j]) / ion_mass)
-                # Flux is NEGATIVE because it is in -z direction
-                qz_bh = -delta_sheath * n_e[i, j] * cs * (kb * Te[i, j])
+                qz_bh = -sheath_flux_mag
 
 
             # --- Divergence ---
@@ -299,10 +306,8 @@ def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
             r_rh_face = r_vec[i] + 0.5 * dr
             r_lh_face = r_vec[i] - 0.5 * dr
             
-            # Handle r=0 geometry carefully
             term_r = 0.0
             if i == 0:
-                # Left area is 0, so r_lh_face * qr_lh is 0
                 term_r = (r_rh_face * qr_rh) / (r_center * dr)
             else:
                 term_r = (r_rh_face * qr_rh - r_lh_face * qr_lh) / (r_center * dr)
@@ -314,9 +319,9 @@ def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
             # 2. Advection
             # =========================
             
-            # At physical boundaries (i=NR-1 and j=0), the Sheath Loss (delta ~ 6.0)
-            # already includes the enthalpy flux of lost particles. 
-            # We set F_adv = 0 at those specific faces to avoid double counting.
+            # NOTE: At all solid boundaries (internal or external), we set 
+            # advection flux to 0 because the enthalpy loss is accounted 
+            # for in the `delta_sheath` term in the Conduction section.
 
             # Right face (i+1/2)
             F_r_rh = 0.0
@@ -326,9 +331,10 @@ def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
                     T_up = Te[i+1, j] if Jr_face > 0.0 else Te[i, j]
                     F_r_rh = -alpha * T_up * Jr_face
                 else:
-                    F_r_rh = -alpha * Te[i, j] * Jer[i, j]
+                    # Internal Wall -> Zero advection
+                    F_r_rh = 0.0
             else:
-                # Wall Boundary: Sheath term handles energy loss
+                # External Wall -> Zero advection
                 F_r_rh = 0.0
 
             # Left face (i-1/2)
@@ -339,9 +345,10 @@ def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
                     T_up = Te[i, j] if Jr_face > 0.0 else Te[i-1, j]
                     F_r_lh = -alpha * T_up * Jr_face
                 else:
-                    F_r_lh = -alpha * Te[i, j] * Jer[i, j]
+                    # Internal Wall -> Zero advection
+                    F_r_lh = 0.0
             else:
-                # Axis Symmetry
+                # Axis
                 F_r_lh = 0.0
 
             # Top face (j+1/2)
@@ -352,7 +359,8 @@ def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
                     T_up = Te[i, j+1] if Jz_face > 0.0 else Te[i, j]
                     F_z_th = -alpha * T_up * Jz_face
                 else:
-                    F_z_th = -alpha * Te[i, j] * Jez[i, j]
+                    # Internal Wall -> Zero advection
+                    F_z_th = 0.0
             else:
                 # Symmetry
                 F_z_th = 0.0
@@ -365,9 +373,10 @@ def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
                     T_up = Te[i, j] if Jz_face > 0.0 else Te[i, j-1]
                     F_z_bh = -alpha * T_up * Jz_face
                 else:
-                    F_z_bh = -alpha * Te[i, j] * Jez[i, j]
+                    # Internal Wall -> Zero advection
+                    F_z_bh = 0.0
             else:
-                # Wall Boundary: Sheath term handles energy loss
+                # External Wall -> Zero advection
                 F_z_bh = 0.0
 
             # Advection Divergence
@@ -382,6 +391,6 @@ def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
             # =========================
             # 3. Update
             # =========================
-            rhs = -div_q - div_Fadv*0 + Q_Joule[i, j]
+            rhs = -div_q - div_Fadv + Q_Joule[i, j]
             dTe_dt = (2.0 / (3.0 * n_e[i, j] * kb)) * rhs
             Te_new[i, j] = Te[i, j] + dt * dTe_dt

@@ -172,9 +172,9 @@ def _compute_EJ_core(phi, mask, r, z,
             if use_rot:
                 jr += sigP * (Bz[i, j] * un_theta[i, j])
 
-            if use_ji:
-                jr += Ji_r[i, j]
-                jz += Ji_z[i, j]
+            #if use_ji:
+            #    jr += Ji_r[i, j]
+            #    jz += Ji_z[i, j]
 
             Jr[i, j] = jr
             Jz[i, j] = jz
