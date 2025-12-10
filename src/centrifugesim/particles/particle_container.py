@@ -511,6 +511,45 @@ class ParticleContainer:
 
             del R, dvr_, dvt_, dvz_, D_p, nu_drag_p
             cp._default_memory_pool.free_all_blocks()
+
+    def drag_diffusion_neutrals(self,
+                       Ur, Ut, Uz,
+                       T, 
+                       nu,
+                       dr, dz,
+                       zmin,
+                       dt):
+        """
+        Ur, Ut, Uz, n, T and nu are host arrays here (Nr, Nz)
+        """
+        Ur_d = cp.asarray(Ur).astype(cp.float32)
+        Ut_d = cp.asarray(Ut).astype(cp.float32)
+        Uz_d = cp.asarray(Uz).astype(cp.float32)
+        T_d = cp.asarray(T).astype(cp.float32)
+        nu_d = cp.asarray(nu).astype(cp.float32)
+
+        # Gather each field to ions positions
+        T_p =  self.gatherScalarField(T_d, dr, dz, zmin)
+        nu_p =  self.gatherScalarField(nu_d, dr, dz, zmin)
+        ur_p =  self.gatherScalarField(Ur_d, dr, dz, zmin)
+        ut_p =  self.gatherScalarField(Ut_d, dr, dz, zmin)
+        uz_p =  self.gatherScalarField(Uz_d, dr, dz, zmin)
+
+        D_p = nu_p*constants.kb*T_p/self.m
+        diffusion_term_p = cp.sqrt(2*D_p*dt)
+
+        R = cp.random.randn(self.N, 3)
+
+        dvr_ = (- nu_p*(self.vr-ur_p)*dt + diffusion_term_p*R[:,0]).astype(cp.float32)
+        dvt_ = (- nu_p*(self.vt-ut_p)*dt + diffusion_term_p*R[:,1]).astype(cp.float32)
+        dvz_ = (- nu_p*(self.vz-uz_p)*dt + diffusion_term_p*R[:,2]).astype(cp.float32)
+
+        self.vr += dvr_
+        self.vt += dvt_
+        self.vz += dvz_
+
+        del R, dvr_, dvt_, dvz_, D_p, diffusion_term_p, nu_p
+        cp._default_memory_pool.free_all_blocks()
             
     def reset_particles(self, geom, nppc):
         """
