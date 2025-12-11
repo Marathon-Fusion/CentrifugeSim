@@ -472,6 +472,8 @@ class ParticleContainer:
                        do_ions=False):
         """
         Uer, Uet, Uez, ne, Te and nu_ei are host arrays here (Nr, Nz)
+        If do_ions, ion quantities are passed and drag diffusion is used for ion-ion Coulomb collisions
+        with only difference of not scaling the collision frequency by me/mi
         """
         Uer_d = cp.asarray(Uer).astype(cp.float32)
         Uet_d = cp.asarray(Uet).astype(cp.float32)
@@ -549,6 +551,49 @@ class ParticleContainer:
         self.vz += dvz_
 
         del R, dvr_, dvt_, dvz_, D_p, diffusion_term_p, nu_p
+        cp._default_memory_pool.free_all_blocks()
+
+    def apply_bohm_diffusion(self, 
+                             D_bohm, 
+                             dr, dz, 
+                             zmin, 
+                             dt):
+        """
+        Applies anomalous Bohm diffusion to particle positions (Spatial transport).
+        Effect: Kicks particles across B-field lines (Radial transport in Z-pinch/Centrifuge).
+        
+        D_bohm: Host array (Nr, Nz) of diffusion coefficients [m^2/s]
+        """
+        # 1. Cast Host Array to Device
+        D_d = cp.asarray(D_bohm).astype(cp.float32)
+
+        # 2. Gather Diffusion Coefficient to Particle Locations
+        # (This gets D_bohm at each particle's current r, z)
+        D_p = self.gatherScalarField(D_d, dr, dz, zmin)
+
+        # 3. Calculate Diffusion Step Size (Standard Deviation)
+        # sigma = sqrt(2 * D * dt)
+        step_scale = cp.sqrt(2.0 * D_p * dt)
+
+        # 4. Generate Random Kicks (Gaussian / Normal Distribution)
+        # We need 2 random numbers per particle for the transverse plane (X, Y)
+        # B is along Z, so Bohm diffusion mixes X and Y (which changes R)
+        R = cp.random.randn(self.N, 2, dtype=cp.float32)
+
+        # 5. Apply "Virtual Cartesian" Update to Radius
+        # Concept: Current pos is (x=r, y=0). Apply kicks dx, dy.
+        # This handles the coordinate geometry naturally without 1/r singularities.
+        
+        dx = R[:, 0] * step_scale
+        dy = R[:, 1] * step_scale
+
+        # r_new = sqrt( (r + dx)^2 + dy^2 )
+        self.r = cp.sqrt( (self.r + dx)**2 + dy**2 )
+
+        # Bohm diffusion is strictly cross-field transport (Perpendicular to B). 
+
+        # 6. Clean up memory
+        del D_d, D_p, step_scale, R, dx, dy
         cp._default_memory_pool.free_all_blocks()
             
     def reset_particles(self, geom, nppc):
