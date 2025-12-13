@@ -11,6 +11,7 @@ B_FLOOR  = 1e-5
 #################################################################################
 ################################### Helper kernels ##############################
 #################################################################################
+
 @njit(cache=True)
 def _kBT(Te, Te_is_eV):
     """Return k_B T in Joules (same shape as Te)."""
@@ -394,3 +395,100 @@ def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
             rhs = -div_q - div_Fadv + Q_Joule[i, j]
             dTe_dt = (2.0 / (3.0 * n_e[i, j] * kb)) * rhs
             Te_new[i, j] = Te[i, j] + dt * dTe_dt
+
+
+@numba.jit(nopython=True)
+def apply_townsend_ionization_sheath(p_grid, 
+                                     E_mag_grid, 
+                                     Je_mag_grid, 
+                                     mask, 
+                                     dt,
+                                     A_townsend=2.25,
+                                     B_townsend=94.0):
+    """
+    Calculates the ionization density increment in high-field sheath regions 
+    using the Townsend alpha coefficient.
+    
+    Physics:
+    In the anode depletion zone, thermal ionization is suppressed.
+    This routine calculates the field-driven ionization source term based on
+    the electron beam flux (current density) and local electric field.
+
+    # Townsend Coefficients for Atomic Hydrogen (H) as default
+    
+    Parameters
+    ----------
+    p_grid : 2D array
+        Neutral gas pressure field [Pascals].
+    E_mag_grid : 2D array
+        Electric field magnitude [V/m].
+    Je_mag_grid : 2D array
+        Electron current density magnitude [A/m^2].
+    mask : 2D array (int/bool)
+        Geometry mask (1=Plasma, 0=Solid). Ionization skipped in Solid.
+    dt : float
+        Time step [s].
+        
+    Returns
+    -------
+    dni_Townsend : 2D array
+        Ion density increment [m^-3] generated in this timestep.
+        (Caller is responsible for creating particles from this density).
+    """
+    Nr, Nz = p_grid.shape
+    dni_Townsend = np.zeros((Nr, Nz), dtype=np.float64)
+    
+    # Thresholds to avoid calculating negligible terms
+    E_thresh = 500.0  # V/m
+    J_thresh = 1.0    # A/m^2
+    P_thresh = 0.01   # Pa
+    
+    qe = constants.q_e
+    
+    for i in range(Nr):
+        for j in range(Nz):
+            
+            # --- 0. Geometry Check ---
+            # Skip if inside solid wall
+            if mask[i, j] == 0:
+                continue
+                
+            # --- 1. Field Checks ---
+            # Electric Field Magnitude
+            E_mag = E_mag_grid[i, j]
+            if E_mag < E_thresh: 
+                continue
+            
+            # Electron Current Flux Magnitude
+            J_mag = Je_mag_grid[i, j]
+            if J_mag < J_thresh: 
+                continue
+            
+            # Pressure Check
+            p_pa = p_grid[i, j]
+            if p_pa < P_thresh: 
+                continue
+            
+            # --- 2. Townsend Alpha Calculation ---
+            # alpha = A * p * exp( - B * p / E )
+            
+            # Reduced field argument (B * p / E)
+            argument = (B_townsend * p_pa) / E_mag
+            
+            # If argument is too large (E is weak relative to P), probability is ~0
+            if argument > 20.0: 
+                continue
+            
+            alpha = A_townsend * p_pa * np.exp(-argument)
+            
+            # --- 3. Source Term ---
+            # S_vol = alpha * Flux_electrons
+            # Flux_electrons = |Je| / e
+            # S_vol units: [1/m] * [A/m^2] / [C] = [1/m^3 s]
+            S_vol = alpha * (J_mag / qe)
+            
+            # --- 4. Density Increment ---
+            # dni = S * dt (m^-3)
+            dni_Townsend[i, j] = S_vol * dt
+
+    return dni_Townsend
