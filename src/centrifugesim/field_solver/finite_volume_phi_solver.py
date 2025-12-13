@@ -238,7 +238,9 @@ def _assemble_coefficients_core(
     rmax_dirichlet_u8,                # uint8 of length Nz (1=Dirichlet at rmax for this j)
     g_top_cathode,                    # length Nr: dphi/dz at top-of-cathode, Neumann array
     phi_dirichlet_val,                # typically 0.0 (anode potential)
-    S                                 # source term on cell centers
+    S,                                # source term on cell centers
+    cathode_dirichlet_val_arr,        # array of length Nr for Dirichlet on top of cathode
+    use_cathode_dirichlet             # Boolean flag
     ):
     aE = np.zeros((Nr, Nz))
     aW = np.zeros((Nr, Nz))
@@ -347,11 +349,29 @@ def _assemble_coefficients_core(
                         b[i, j]  += as_face * phi_dirichlet_val
                         aS[i, j]  = 0.0
                     elif cathode_u8[i, j-1] == 1:
-                        # Top of cathode: impose ∂φ/∂z = g_top_cathode[i]
-                        ks = sigPar_n[i, j]
-                        qzS = ks * g_top_cathode[i]
-                        b[i, j] += r_c[i] * qzS / dz_j[j]
-                        aS[i, j]  = 0.0
+                        # Top of cathode: either Dirichlet or Neumann
+                        if use_cathode_dirichlet:
+                            # Dirichlet: V = cathode_dirichlet_val_arr[i]
+                            # Uses cell conductivity consistent with other Dirichlet boundaries
+
+                            # Fetch the Dirichlet value for this radial cell
+                            val = cathode_dirichlet_val_arr[i]
+                            if(not np.isnan(val)):
+                                ks = sigmaPar_cell[i, j]
+                                as_face = (r_c[i] * ks) / (dz_s[j] * dz_j[j])
+                                aP[i, j] += as_face
+                                b[i, j]  += as_face * cathode_dirichlet_val_arr[i]
+                                aS[i, j]  = 0.0
+
+                            else:
+                                aS[i, j]  = 0.0
+
+                        else:
+                            # Top of cathode: impose ∂φ/∂z = g_top_cathode[i]
+                            ks = sigPar_n[i, j]
+                            qzS = ks * g_top_cathode[i]
+                            b[i, j] += r_c[i] * qzS / dz_j[j]
+                            aS[i, j]  = 0.0
                     else:
                         # other solid below: Neumann zero
                         aS[i, j] = 0.0
@@ -428,6 +448,7 @@ def assemble_coefficients(
     r, z, sigmaP, sigmaPar,
     geom,
     dphi_dz_cathode_top=None,         # shape (Nr,), gradient at z=zmax_cathode (on plasma side)
+    cathode_voltage_profile=None,     # If not None, overrides dphi_dz
     phi_anode_value=0.0,
     S=None
 ):
@@ -468,6 +489,20 @@ def assemble_coefficients(
         if g_top.shape != (Nr,):
             raise ValueError("dphi_dz_cathode_top must be shape (Nr,)")
 
+    # Dirichlet Array (New)
+    if cathode_voltage_profile is not None:
+        use_cathode_dirichlet = True
+        c_val_arr = np.asarray(cathode_voltage_profile, dtype=sigmaP.dtype)
+        if c_val_arr.shape != (Nr,):
+             # Broadcast scalar if user was lazy and sent a float
+             if c_val_arr.size == 1:
+                 c_val_arr = np.full(Nr, float(c_val_arr), dtype=sigmaP.dtype)
+             else:
+                 raise ValueError("cathode_voltage_profile must be shape (Nr,) or scalar")
+    else:
+        use_cathode_dirichlet = False
+        c_val_arr = np.zeros(Nr, dtype=sigmaP.dtype) # Dummy array
+
     # Source term
     if S is None:
         S = np.zeros((Nr, Nz), dtype=sigmaP.dtype)
@@ -482,7 +517,9 @@ def assemble_coefficients(
         sigmaP, sigmaPar,
         mask_u8, cathode_u8, anode_u8,
         rmax_dirichlet_by_j,
-        g_top, phi_anode_value, S
+        g_top, phi_anode_value, S,
+        c_val_arr,
+        use_cathode_dirichlet
     )
     return aP, aE, aW, aN, aS, b
 
@@ -690,7 +727,8 @@ def solve_anisotropic_poisson_FV(geom,
                                  ne=None, pe=None, Bz=None, un_theta=None,
                                  Ji_r=None, Ji_z=None,
                                  ne_floor=1.0,
-                                 dphi_dz_cathode_top=None,  # NEW: array (Nr,) at z=zmax_cathode
+                                 dphi_dz_cathode_top=None,  # array (Nr,) at z=zmax_cathode
+                                 cathode_voltage_profile=None, # array (Nr,) or None
                                  phi_anode_value=0.0,
                                  phi0=None, omega=1.8, tol=1e-10, max_iter=50_000,
                                  verbose=True):
@@ -726,6 +764,7 @@ def solve_anisotropic_poisson_FV(geom,
         sigmaP=sigma_P, sigmaPar=sigma_parallel,
         geom=geom,
         dphi_dz_cathode_top=dphi_dz_cathode_top,
+        cathode_voltage_profile=cathode_voltage_profile,
         phi_anode_value=phi_anode_value,
         S=S
     )
