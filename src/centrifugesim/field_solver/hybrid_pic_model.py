@@ -25,6 +25,7 @@ class HybridPICModel:
         self.z  = geom.z
 
         # for cathode boundary condition
+        self.phi_cathode_vec = np.zeros(self.Nr).astype(np.float64)
         self.dphi_dz_cathode_top_vec = np.zeros(self.Nr).astype(np.float64)
         self.Jz_cathode_top_vec = np.zeros(self.Nr).astype(np.float64)
 
@@ -131,24 +132,45 @@ class HybridPICModel:
         tol=1e-9, max_iter=100_000,
         phi_anode_value=0,
         Ji_r=None, Ji_z=None,
-        phi0=None, verbose=True):
+        phi0=None,
+        cathode_dirichlet = False,
+        verbose=True):
 
-        phi, info = solve_anisotropic_poisson_FV(
-            geom,
-            electron_fluid.sigma_P_grid,
-            electron_fluid.sigma_parallel_grid,
-            ne=electron_fluid.ne_grid,
-            pe=electron_fluid.pe_grid,
-            Bz=self.Bz_grid,
-            un_theta=neutral_fluid.un_theta_grid,
-            ne_floor=electron_fluid.ne_floor,
-            Ji_r=Ji_r, Ji_z=Ji_z,
-            dphi_dz_cathode_top=self.dphi_dz_cathode_top_vec,
-            phi_anode_value=phi_anode_value,
-            phi0=phi0,
-            omega=1.8, tol=tol, max_iter=max_iter,
-            verbose=verbose
-        )
+        if(cathode_dirichlet):
+            phi, info = solve_anisotropic_poisson_FV(
+                geom,
+                electron_fluid.sigma_P_grid,
+                electron_fluid.sigma_parallel_grid,
+                ne=electron_fluid.ne_grid,
+                pe=electron_fluid.pe_grid,
+                Bz=self.Bz_grid,
+                un_theta=neutral_fluid.un_theta_grid,
+                ne_floor=electron_fluid.ne_floor,
+                Ji_r=Ji_r, Ji_z=Ji_z,
+                cathode_voltage_profile=self.phi_cathode_vec,
+                phi_anode_value=phi_anode_value,
+                phi0=phi0,
+                omega=1.8, tol=tol, max_iter=max_iter,
+                verbose=verbose
+            )
+
+        else:
+            phi, info = solve_anisotropic_poisson_FV(
+                geom,
+                electron_fluid.sigma_P_grid,
+                electron_fluid.sigma_parallel_grid,
+                ne=electron_fluid.ne_grid,
+                pe=electron_fluid.pe_grid,
+                Bz=self.Bz_grid,
+                un_theta=neutral_fluid.un_theta_grid,
+                ne_floor=electron_fluid.ne_floor,
+                Ji_r=Ji_r, Ji_z=Ji_z,
+                dphi_dz_cathode_top=self.dphi_dz_cathode_top_vec,
+                phi_anode_value=phi_anode_value,
+                phi0=phi0,
+                omega=1.8, tol=tol, max_iter=max_iter,
+                verbose=verbose
+            )
 
         Er, Ez, Jer, Jez, Er_gradpe, Ez_gradpe = compute_E_and_J(phi, geom,
                             electron_fluid.sigma_P_grid,
