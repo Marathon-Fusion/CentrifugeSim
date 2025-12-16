@@ -264,19 +264,17 @@ class ElectronFluidContainer:
 
         # Subcycling with operator splitting: e–i then e–n each substep
         for _ in range(n_sub):
-            #Q_coll_en = 3 * self.ne_grid * constants.kb * (
-            #    m_ratio_n * self.nu_en_grid * (self.Te_grid - neutral_fluid.T_n_grid) )
+            Q_coll_en = 3 * self.ne_grid * constants.kb * (
+                m_ratio_n * self.nu_en_grid * (self.Te_grid - neutral_fluid.T_n_grid) )
 
             Q_coll_ei = 3 * self.ne_grid * constants.kb * (
                 m_ration_i * self.nu_ei_grid * (self.Te_grid - Ts_host) )
 
-            #de = dt_sub*(Q_coll_en[geom.mask==1] + Q_coll_ei[geom.mask==1]) # J/m^3
-
-            de = dt_sub*(Q_coll_ei[geom.mask==1]) # J/m^3
+            de = dt_sub*(Q_coll_en[geom.mask==1] + Q_coll_ei[geom.mask==1]) # J/m^3
 
             # Write back masked regions
             self.Te_grid[geom.mask==1] -= de/(3/2*constants.kb*ne[geom.mask==1])
-            neutral_fluid.T_n_grid[geom.mask==1] += de/(3/2*constants.kb*nn[geom.mask==1])
+            neutral_fluid.T_n_grid[geom.mask==1] += dt_sub*Q_coll_en[geom.mask==1]/(3/2*constants.kb*nn[geom.mask==1])
 
 
     def apply_boundary_conditions(self):
