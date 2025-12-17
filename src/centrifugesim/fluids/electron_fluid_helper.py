@@ -140,8 +140,11 @@ def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
                Jer, Jez,
                mask, dt, ion_mass):
     """
-    Advances electron temperature with PHYSICAL boundaries at external walls
-    AND internal masked objects (sheath loss).
+    Advances electron temperature with specific boundary conditions:
+    1. Bohm sheath loss ONLY at z=0 (j=0) and r=R_max (i=NR-1).
+    2. Internal masked objects have NO Bohm loss, but allow Advection.
+    3. Advection at internal masks driven by u_e (-J_e).
+    4. Top boundary (z=zmax) is insulating (no flux).
     """
     NR, NZ = Te.shape
     
@@ -162,8 +165,8 @@ def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
                 continue
 
             # Pre-calculate sound speed for this node (used for BCs)
-            # cs = sqrt(k Te / Mi)
             cs_local = np.sqrt((kb * Te[i, j]) / ion_mass)
+            # Only used at z=0 and r=R_max
             sheath_flux_mag = delta_sheath * n_e[i, j] * cs_local * (kb * Te[i, j])
 
             # =========================
@@ -197,12 +200,14 @@ def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
                         qr_rh = -k_eff * (Te[i+1, j] - Te[i, j]) / dr
                 
                 else: 
-                    # NEW: Neighbor is Masked (Solid). 
-                    # Flux is POSITIVE (leaves i towards i+1)
-                    qr_rh = sheath_flux_mag
+                    # Neighbor is Masked (Solid). 
+                    # User Req: Bohm ONLY at rmax/zmin. Internal mask -> No Bohm.
+                    # Set conduction to 0.0 (Insulating/Advection dominated).
+                    qr_rh = 0.0
             
             # CASE B: Outer Physical Wall (r = rmax)
             else: 
+                # User Req: Only bohm through sheath here.
                 qr_rh = sheath_flux_mag
 
             # --- Left face (i-1/2) ---
@@ -229,9 +234,8 @@ def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
                         k_eff = 0.5 * (kappa_perp[i, j] + kappa_perp[i-1, j])
                         qr_lh = -k_eff * (Te[i, j] - Te[i-1, j]) / dr
                 else:
-                    # NEW: Neighbor is Masked (Solid).
-                    # Flux is NEGATIVE (leaves i towards i-1)
-                    qr_lh = -sheath_flux_mag
+                    # Neighbor is Masked -> No Bohm.
+                    qr_lh = 0.0 
             
             # CASE B: Axis of Symmetry (r = 0)
             else:
@@ -261,12 +265,12 @@ def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
                         k_eff = 0.5 * (kappa_perp[i, j] + kappa_perp[i, j+1])
                         qz_th = -k_eff * (Te[i, j+1] - Te[i, j]) / dz
                 else:
-                    # NEW: Neighbor is Masked (Solid).
-                    # Flux is POSITIVE (leaves j towards j+1)
-                    qz_th = sheath_flux_mag
+                    # Neighbor is Masked -> No Bohm.
+                    qz_th = 0.0
             
-            # CASE B: Top Symmetry Plane (z = zmax)
+            # CASE B: Top Boundary (z = zmax)
             else:
+                # User Req: "at z=zmax no energy flux"
                 qz_th = 0.0
 
             # --- Bottom face (j-1/2) ---
@@ -287,22 +291,22 @@ def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
                         k_zz_bh = k_perp_bh + k_a_bh * bz_bh * bz_bh
                         k_rz_bh = k_a_bh * br_bh * bz_bh
                         dT_dz_bh = (Te[i, j] - Te[i, j-1]) / dz
-                        dT_dr_bh = (Te[i+1, j] - Te[i-1, j] + Te[i+1, j-1] - Te[i-1, j-1]) / (4.0 * dr)
+                        dT_dr_bh = (Te[i+1, j] - Te[i-1, j] + Te[i+1, j+1] - Te[i-1, j+1]) / (4.0 * dr)
                         qz_bh = -(k_rz_bh * dT_dr_bh + k_zz_bh * dT_dz_bh)
                     else:
                         k_eff = 0.5 * (kappa_perp[i, j] + kappa_perp[i, j-1])
                         qz_bh = -k_eff * (Te[i, j] - Te[i, j-1]) / dz
                 else:
-                    # NEW: Neighbor is Masked (Solid).
-                    # Flux is NEGATIVE (leaves j towards j-1)
-                    qz_bh = -sheath_flux_mag
+                    # Neighbor is Masked -> No Bohm.
+                    qz_bh = 0.0
 
             # CASE B: Bottom Physical Wall (z = zmin)
             else:
+                # User Req: "at z=zmin... bohm"
                 qz_bh = -sheath_flux_mag
 
 
-            # --- Divergence ---
+            # --- Divergence (Conduction) ---
             r_center = r_vec[i] + 1e-12
             r_rh_face = r_vec[i] + 0.5 * dr
             r_lh_face = r_vec[i] - 0.5 * dr
@@ -320,9 +324,10 @@ def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
             # 2. Advection
             # =========================
             
-            # NOTE: At all solid boundaries (internal or external), we set 
-            # advection flux to 0 because the enthalpy loss is accounted 
-            # for in the `delta_sheath` term in the Conduction section.
+            # NOTE:
+            # - At zmin and rmax: Advection = 0 (Bohm handled separately).
+            # - At internal masked faces: Advection != 0 (Enabled).
+            # - We use Te[i,j] (self) as T_up when the neighbor is a mask.
 
             # Right face (i+1/2)
             F_r_rh = 0.0
@@ -332,10 +337,12 @@ def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
                     T_up = Te[i+1, j] if Jr_face > 0.0 else Te[i, j]
                     F_r_rh = -alpha * T_up * Jr_face
                 else:
-                    # Internal Wall -> Zero advection
-                    F_r_rh = 0.0
+                    # Internal Wall -> ENABLE Advection
+                    Jr_face = 0.5 * (Jer[i, j] + Jer[i+1, j])
+                    T_up = Te[i, j] # Use local T for masked interaction
+                    F_r_rh = -alpha * T_up * Jr_face
             else:
-                # External Wall -> Zero advection
+                # External Wall (rmax) -> User Req: No Advection (Bohm only)
                 F_r_rh = 0.0
 
             # Left face (i-1/2)
@@ -346,8 +353,10 @@ def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
                     T_up = Te[i, j] if Jr_face > 0.0 else Te[i-1, j]
                     F_r_lh = -alpha * T_up * Jr_face
                 else:
-                    # Internal Wall -> Zero advection
-                    F_r_lh = 0.0
+                    # Internal Wall -> ENABLE Advection
+                    Jr_face = 0.5 * (Jer[i, j] + Jer[i-1, j])
+                    T_up = Te[i, j]
+                    F_r_lh = -alpha * T_up * Jr_face
             else:
                 # Axis
                 F_r_lh = 0.0
@@ -360,10 +369,12 @@ def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
                     T_up = Te[i, j+1] if Jz_face > 0.0 else Te[i, j]
                     F_z_th = -alpha * T_up * Jz_face
                 else:
-                    # Internal Wall -> Zero advection
-                    F_z_th = 0.0
+                    # Internal Wall -> ENABLE Advection
+                    Jz_face = 0.5 * (Jez[i, j] + Jez[i, j+1])
+                    T_up = Te[i, j]
+                    F_z_th = -alpha * T_up * Jz_face
             else:
-                # Symmetry
+                # Symmetry / Top Wall (zmax) -> User Req: No energy flux
                 F_z_th = 0.0
 
             # Bottom face (j-1/2)
@@ -374,10 +385,12 @@ def solve_step(Te, Te_new, dr, dz, r_vec, n_e, Q_Joule,
                     T_up = Te[i, j] if Jz_face > 0.0 else Te[i, j-1]
                     F_z_bh = -alpha * T_up * Jz_face
                 else:
-                    # Internal Wall -> Zero advection
-                    F_z_bh = 0.0
+                    # Internal Wall -> ENABLE Advection
+                    Jz_face = 0.5 * (Jez[i, j] + Jez[i, j-1])
+                    T_up = Te[i, j]
+                    F_z_bh = -alpha * T_up * Jz_face
             else:
-                # External Wall -> Zero advection
+                # External Wall (zmin) -> User Req: No Advection (Bohm only)
                 F_z_bh = 0.0
 
             # Advection Divergence

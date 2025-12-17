@@ -504,14 +504,19 @@ class ParticleContainer:
             R = cp.random.randn(self.N, 3)
 
             dvr_ = (- nu_drag_p[ind]*(self.vr[ind]-uer_p[ind])*dt + diffusion_term_p[ind]*R[ind,0]).astype(cp.float32)
-            dvt_ = (- nu_drag_p[ind]*(self.vt[ind]-uet_p[ind])*dt + diffusion_term_p[ind]*R[ind,1]).astype(cp.float32)
+            if(do_ions):
+                dvt_ = (- nu_drag_p[ind]*(self.vt[ind]-uet_p[ind])*dt + diffusion_term_p[ind]*R[ind,1]).astype(cp.float32)
             dvz_ = (- nu_drag_p[ind]*(self.vz[ind]-uez_p[ind])*dt + diffusion_term_p[ind]*R[ind,2]).astype(cp.float32)
 
             self.vr[ind] += dvr_
-            self.vt[ind] += dvt_
+            if(do_ions):
+                self.vt[ind] += dvt_
             self.vz[ind] += dvz_
 
-            del R, dvr_, dvt_, dvz_, D_p, nu_drag_p
+            if(do_ions):
+                del dvt_
+
+            del R, dvr_, dvz_, D_p, nu_drag_p
             cp._default_memory_pool.free_all_blocks()
 
     def drag_diffusion_neutrals(self,

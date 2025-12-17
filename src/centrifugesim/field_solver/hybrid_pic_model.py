@@ -45,6 +45,7 @@ class HybridPICModel:
 
         # q_ohm for electron energy equation
         self.q_ohm_grid = np.zeros((self.Nr, self.Nz)).astype(np.float64)
+        self.q_RF = np.zeros((self.Nr, self.Nz)).astype(np.float64)
 
         self.Br_grid = np.zeros((self.Nr, self.Nz)).astype(np.float64)
         self.Bt_grid = np.zeros((self.Nr, self.Nz)).astype(np.float64)  # unused in solver; kept for pusher

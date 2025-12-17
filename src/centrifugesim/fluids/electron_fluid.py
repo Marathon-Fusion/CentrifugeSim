@@ -193,8 +193,6 @@ class ElectronFluidContainer:
             )
             self.Te_grid[:, :] = Te_new
 
-            # Enforce Dirichlet BCs at cathode and anode
-            # This is just to test, should change to sheath based model!
             self.Te_grid[geom.cathode_mask] = geom.temperature_cathode
             self.Te_grid[geom.anode1_mask] = geom.temperature_anode
             self.Te_grid[geom.anode2_mask] = geom.temperature_anode
