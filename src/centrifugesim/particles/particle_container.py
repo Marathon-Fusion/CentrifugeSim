@@ -330,27 +330,6 @@ class ParticleContainer:
         self.Js_z = self.depositScalarField(self.Js_z, (self.vz*self.q).astype(cp.float32), dr, dz, zmin)
         self.Js_z = self.Js_z/volume_field_d
 
-        # Write apply_BC_Js and call here for each component.
-        #self.Js_r[0,:] = 0
-        #self.Js_t[0,:] = 0
-        #self.Js_z[0,:] = self.Js_z[1,:]
-
-        #self.ns[:,0] = self.ns[:,1]
-        #self.ns[:,Nz-1] = self.ns[:,Nz-2]
-
-        # change to verboncour
-        #self.ns[0,:] = self.ns[1,:]
-        #self.ns[Nr-1,:] = self.ns[Nr-2,:]
-
-        #self.Js_r[:,0] = self.Js_r[:,1]
-        #self.Js_r[:,Nz-1] = self.Js_r[:,Nz-2]
-
-        #self.Js_t[:,0] = self.Js_t[:,1]
-        #self.Js_t[:,Nz-1] = self.Js_t[:,Nz-2]
-
-        #self.Js_z[:,0] = self.Js_z[:,1]
-        #self.Js_z[:,Nz-1] = self.Js_z[:,Nz-2]
-
     def depositTemperature_dim(self, u_field, vp, dr, dz, zmin, Nr, Nz):
 
         Ts_dim = cp.zeros((Nr, Nz)).astype(cp.float64)
@@ -861,7 +840,8 @@ class ParticleContainer:
         del un_r_device, un_t_device, un_z_device
         cp._default_memory_pool.free_all_blocks()
 
-    def do_charge_exchange(
+
+    def do_charge_exchange_moment_preserving(
         self,
         geom,
         Tn_host, nn_host,
@@ -869,100 +849,160 @@ class ParticleContainer:
         m_n,
         dt,
         sigma_mt=5e-19,
-        include_thermal=True,
-        seed=None
+        seed=None,
     ):
         """
-        Charge-exchange collisions with background neutrals.
-
-        Parameters
-        ----------
-        Tn_host : np.ndarray, shape (Nr,Nz), float64
-            Neutral temperature field [K] on host.
-        nn_host : np.ndarray, shape (Nr,Nz), float64
-            Neutral number density field [m^-3] on host.
-        un_r_host, un_theta_host, un_z_host : np.ndarray (Nr,Nz), float64
-            Neutral bulk velocity components [m/s] on host, cylindrical components.
-        m_n : float
-            Neutral mass [kg].
-        sigma_mt : float, optional
-            Momentum-transfer cross-section [m^2]. Default 5e-19.
-        seed : int or None
-            RNG seed for reproducibility of collision sampling.
-
-        Notes
-        -----
-        * Uses P_coll = 1 - exp(-nn * sigma_mt * u * dt) with u = |v_i - v_n|.
-        * Samples one neutral velocity from a Maxwellian at local Tn and bulk (u_n) per ion.
-        * Post-collision ion velocity is set to the sampled neutral velocity.
+        Moment-Preserving CEX: Enforces exact fluid T and u on colliding particles.
         """
-        # check number of ions
+        import numpy as np # Ensure numpy is available for the fix
+
         N = self.N
-        if N == 0:
-            return  # nothing to do
+        if N == 0: return
 
-        m_i = float(self.m)
+        # 1. Setup Data on Device
+        Tn_dev = cp.asarray(Tn_host, dtype=cp.float32)
+        nn_dev = cp.asarray(nn_host, dtype=cp.float32)
+        unr_dev = cp.asarray(un_r_host, dtype=cp.float32)
+        unt_dev = cp.asarray(un_t_host, dtype=cp.float32)
+        unz_dev = cp.asarray(un_z_host, dtype=cp.float32)
+        
+        # Grid params for binning
+        dr, dz, zmin = geom.dr, geom.dz, geom.zmin
+        
+        # 2. Gather interpolated values for Probability ONLY
+        #    (We keep accurate probability, even if we bin velocities later)
+        Tn_loc = self.gatherScalarField(Tn_dev, dr, dz, zmin)
+        nn_loc = self.gatherScalarField(nn_dev, dr, dz, zmin)
+        unr_loc = self.gatherScalarField(unr_dev, dr, dz, zmin)
+        unt_loc = self.gatherScalarField(unt_dev, dr, dz, zmin)
+        unz_loc = self.gatherScalarField(unz_dev, dr, dz, zmin)
 
-        Tn_device = cp.asarray(Tn_host).astype(cp.float32)
-        nn_device = cp.asarray(nn_host).astype(cp.float32)
-        un_r_device = cp.asarray(un_r_host).astype(cp.float32)
-        un_t_device = cp.asarray(un_t_host).astype(cp.float32)
-        un_z_device = cp.asarray(un_z_host).astype(cp.float32)
+        # 3. Analytic Probability (Stable Rate)
+        v_rel_sq = (self.vr - unr_loc)**2 + (self.vt - unt_loc)**2 + (self.vz - unz_loc)**2
+        v_th_n_sq = (3.0 * constants.kb * Tn_loc) / m_n
+        umag_eff = cp.sqrt(v_rel_sq + v_th_n_sq)
+        P = 1.0 - cp.exp(- nn_loc * sigma_mt * umag_eff * dt)
 
-        # Gather local neutral state at particle positions
-        Tn_loc = self.gatherScalarField(Tn_device, geom.dr, geom.dz, geom.zmin)     # [K]      
-        nn_loc = self.gatherScalarField(nn_device, geom.dr, geom.dz, geom.zmin)     # [m^-3]
-        unr_loc = self.gatherScalarField(un_r_device, geom.dr, geom.dz, geom.zmin)  # [m/s]
-        unt_loc = self.gatherScalarField(un_t_device, geom.dr, geom.dz, geom.zmin)  # [m/s]
-        unz_loc = self.gatherScalarField(un_z_device, geom.dr, geom.dz, geom.zmin)  # [m/s]
+        # 4. Determine Collisions
+        if seed is not None: cp.random.seed(seed)
+        rcoll = cp.random.rand(N, dtype=cp.float32)
+        collided_mask = rcoll < P
+        num_collided = int(cp.sum(collided_mask))
 
-        # Output buffers (in-place is fine, but separate arrays keep it safe)
-        vr_out = cp.empty_like(self.vr)
-        vt_out = cp.empty_like(self.vt)
-        vz_out = cp.empty_like(self.vz)
+        if num_collided == 0:
+            return
 
-        # Random numbers: generate with NumPy then move to CuPy (as requested)
-        rcoll = cp.random.rand(N, dtype=cp.float32)     # collision acceptance
+        # --- MOMENT PRESERVING ALGORITHM STARTS HERE ---
 
-        # Gaussian random numbers for neutral thermal velocities
-        g1    = cp.random.randn(N, dtype=cp.float32)    # Gaussian for neutral thermal vx
-        g2    = cp.random.randn(N, dtype=cp.float32)    # Gaussian for neutral thermal vy
-        g3    = cp.random.randn(N, dtype=cp.float32)    # Gaussian for neutral thermal vz
+        # A. Identify Colliding Particles and their Cell Indices
+        p_idx = cp.where(collided_mask)[0]  # Indices of particles that collided
+        
+        r_coll = self.r[p_idx]
+        z_coll = self.z[p_idx]
+        
+        # Compute integer cell indices (clamped to grid bounds)
+        ir = cp.floor(r_coll / dr).astype(cp.int32)
+        iz = cp.floor((z_coll - zmin) / dz).astype(cp.int32)
+        ir = cp.clip(ir, 0, Tn_dev.shape[0] - 1)
+        iz = cp.clip(iz, 0, Tn_dev.shape[1] - 1)
+        
+        # Flattened Cell ID for sorting
+        cell_ids = ir * Tn_dev.shape[1] + iz
 
-        # Sample neutral velocity from drifting maxwellian
-        if(include_thermal):
-            vnr = unr_loc + cp.sqrt((2.0 * constants.kb * Tn_loc) / m_n) * g1
-            vnt = unt_loc + cp.sqrt((2.0 * constants.kb * Tn_loc) / m_n) * g2
-            vnz = unz_loc + cp.sqrt((2.0 * constants.kb * Tn_loc) / m_n) * g3
-        else:
-            vnr = unr_loc
-            vnt = unt_loc
-            vnz = unz_loc
+        # B. Sort particles by Cell ID to group them
+        sort_order = cp.argsort(cell_ids)
+        p_idx_sorted = p_idx[sort_order]
+        cell_ids_sorted = cell_ids[sort_order]
 
-        # calculate umag
-        udiff_r = self.vr - vnr
-        udiff_t = self.vt - vnt
-        udiff_z = self.vz - vnz
-        umag = cp.sqrt(udiff_r**2 + udiff_t**2 + udiff_z**2)  # [m/s]
+        # C. Find boundaries of each cell group
+        unique_cells, indices = cp.unique(cell_ids_sorted, return_index=True)
+        
+        # D. Generate RAW Gaussian velocities for ALL collided particles
+        g1 = cp.random.randn(num_collided, dtype=cp.float32)
+        g2 = cp.random.randn(num_collided, dtype=cp.float32)
+        g3 = cp.random.randn(num_collided, dtype=cp.float32)
+        
+        # E. Calculate Statistics per Cell Group
+        reduce_idx = cp.append(indices, num_collided) # ranges for reduceat
+        
+        # Counts per cell (k)
+        k_per_cell = cp.diff(reduce_idx) 
+        
+        # Sums
+        sum_g1 = cp.add.reduceat(g1, indices)
+        sum_g2 = cp.add.reduceat(g2, indices)
+        sum_g3 = cp.add.reduceat(g3, indices)
+        
+        # Means
+        mean_g1 = sum_g1 / k_per_cell
+        mean_g2 = sum_g2 / k_per_cell
+        mean_g3 = sum_g3 / k_per_cell
 
-        # Probability of collision
-        P = 1.0 - cp.exp(- nn_loc * sigma_mt * umag * dt)
+        # Standard Deviations
+        sum_sq_g1 = cp.add.reduceat(g1**2, indices)
+        sum_sq_g2 = cp.add.reduceat(g2**2, indices)
+        sum_sq_g3 = cp.add.reduceat(g3**2, indices)
 
-        # do collisions
-        collided = rcoll < P
-        if(len(collided)>0):
-            self.vr[collided] = vnr[collided]
-            self.vt[collided] = vnt[collided]
-            self.vz[collided] = vnz[collided]
+        # Safety epsilon added to prevent division by zero if k=1
+        std_g1 = cp.sqrt( (sum_sq_g1/k_per_cell) - mean_g1**2 + 1e-12) 
+        std_g2 = cp.sqrt( (sum_sq_g2/k_per_cell) - mean_g2**2 + 1e-12)
+        std_g3 = cp.sqrt( (sum_sq_g3/k_per_cell) - mean_g3**2 + 1e-12)
 
-        # del and free memory
-        del vr_out, vt_out, vz_out
-        del g1, g2, g3
-        del rcoll
-        del Tn_loc, nn_loc, unr_loc, unt_loc, unz_loc
-        del Tn_device, nn_device
-        del un_r_device, un_t_device, un_z_device
+        # F. Map Group Stats back to Individual Particles
+        # FIX: Move to CPU (numpy) for broadcasting to avoid CuPy TypeErrors
+        k_per_cell_host = k_per_cell.get().astype(int)
+
+        # Move source stats to CPU
+        mean_g1_cpu, std_g1_cpu = mean_g1.get(), std_g1.get()
+        mean_g2_cpu, std_g2_cpu = mean_g2.get(), std_g2.get()
+        mean_g3_cpu, std_g3_cpu = mean_g3.get(), std_g3.get()
+
+        # Broadcast on CPU using numpy
+        mean_g1_map = cp.asarray(np.repeat(mean_g1_cpu, k_per_cell_host))
+        mean_g2_map = cp.asarray(np.repeat(mean_g2_cpu, k_per_cell_host))
+        mean_g3_map = cp.asarray(np.repeat(mean_g3_cpu, k_per_cell_host))
+        
+        std_g1_map = cp.asarray(np.repeat(std_g1_cpu, k_per_cell_host))
+        std_g2_map = cp.asarray(np.repeat(std_g2_cpu, k_per_cell_host))
+        std_g3_map = cp.asarray(np.repeat(std_g3_cpu, k_per_cell_host))
+
+        # G. Retrieve Fluid Targets
+        ir_u = unique_cells // Tn_dev.shape[1]
+        iz_u = unique_cells % Tn_dev.shape[1]
+        
+        T_target = Tn_dev[ir_u, iz_u]
+        ur_target = unr_dev[ir_u, iz_u]
+        ut_target = unt_dev[ir_u, iz_u]
+        uz_target = unz_dev[ir_u, iz_u]
+
+        # Calculate thermal velocity targets on GPU
+        v_th_target = cp.sqrt(constants.kb * T_target / m_n)
+
+        # Move targets to CPU for broadcasting
+        v_th_target_cpu = v_th_target.get()
+        ur_target_cpu = ur_target.get()
+        ut_target_cpu = ut_target.get()
+        uz_target_cpu = uz_target.get()
+
+        # Broadcast on CPU and move back to GPU
+        v_th_map = cp.asarray(np.repeat(v_th_target_cpu, k_per_cell_host))
+        ur_map   = cp.asarray(np.repeat(ur_target_cpu, k_per_cell_host))
+        ut_map   = cp.asarray(np.repeat(ut_target_cpu, k_per_cell_host))
+        uz_map   = cp.asarray(np.repeat(uz_target_cpu, k_per_cell_host))
+
+        # H. The Final Correction Formula
+        vr_new = (g1 - mean_g1_map) * (v_th_map / std_g1_map) + ur_map
+        vt_new = (g2 - mean_g2_map) * (v_th_map / std_g2_map) + ut_map
+        vz_new = (g3 - mean_g3_map) * (v_th_map / std_g3_map) + uz_map
+
+        # I. Write Back to Main Arrays using the Sorted Indices
+        self.vr[p_idx_sorted] = vr_new
+        self.vt[p_idx_sorted] = vt_new
+        self.vz[p_idx_sorted] = vz_new
+
+        # Cleanup
         cp._default_memory_pool.free_all_blocks()
+
 
     def inject_cathode_ions(self, geom, hybrid_pic, electron_fluid, neutral_fluid, dt, nppc_inj=5):
         """
@@ -1127,7 +1167,7 @@ class ParticleContainer:
         k = i + j * geom.Nr
         return k
 
-    def merge_particles(self, geom, nppc_max=150, nppc_target=100):
+    def merge_particles_old(self, geom, nppc_max=150, nppc_target=100):
         """
         Resamples particles in dense cells to reduce count to nppc_target.
         Conserves Mass exactly. Momentum/Energy conserved statistically.
@@ -1210,6 +1250,110 @@ class ParticleContainer:
             self.weight = self.weight[keep_mask]
             
             # Update Total Number
+            self.N = num_kept
+            print(f"    Merged: Removed {num_discarded} particles. New N: {self.N}")
+        else:
+            print("    No merging needed.")
+
+    def merge_particles(self, geom, min_nppc_target=20, max_nppc_target=1000, trigger_ratio=1.5):
+        """
+        Resamples particles based on local density self.ns.
+        Target NPPC scales linearly with local density from min_nppc_target to max_nppc_target.
+        
+        Args:
+            trigger_ratio: Factor above target to trigger resampling (e.g., 1.5 means 
+                           if target is 100, we only merge if count > 150).
+        """
+        if self.N == 0:
+            return
+
+        print(f"[{self.name}] Checking for merge/resample with dynamic scaling...")
+
+        # 1. Get linear cell index for every particle
+        k = self.get_cell_indices(geom)
+        num_cells = geom.Nr * geom.Nz
+
+        # 2. Prepare the Dynamic Target Grid
+        # Flatten ns to match k indexing (i is fast index -> Fortran order)
+        ns_flat = self.ns.ravel(order='F')
+        
+        # Calculate min/max density (ignoring empty cells to avoid skewing)
+        # We use a small epsilon to detect non-zero density
+        valid_mask = ns_flat > 1e-20 
+        
+        if not cp.any(valid_mask):
+            print("    No density data found (ns is empty). Skipping merge.")
+            return
+
+        ns_min = cp.min(ns_flat[valid_mask])
+        ns_max = cp.max(ns_flat[valid_mask])
+        
+        # Initialize grid with the minimum target
+        target_grid = cp.full_like(ns_flat, min_nppc_target, dtype=cp.float32)
+
+        # Interpolate targets where density is valid
+        # Formula: target = min_t + (ns - min_ns) * (max_t - min_t) / (max_ns - min_ns)
+        if ns_max > ns_min:
+            slope = (max_nppc_target - min_nppc_target) / (ns_max - ns_min)
+            target_grid[valid_mask] = min_nppc_target + slope * (ns_flat[valid_mask] - ns_min)
+        else:
+            # If density is uniform (max == min), use the max target everywhere
+            target_grid[valid_mask] = max_nppc_target
+
+        # Define the trigger threshold grid (e.g. 1.5x the target)
+        trigger_grid = target_grid * trigger_ratio
+
+        # 3. Count particles per cell
+        cell_counts = cp.bincount(k, minlength=num_cells)
+
+        # 4. Map grid data to individual particles
+        # We look up the count, target, and trigger for the cell each particle resides in
+        particle_counts = cell_counts[k]
+        particle_targets = target_grid[k]
+        particle_triggers = trigger_grid[k]
+
+        # 5. Create "Keep" mask
+        random_draws = cp.random.random(self.N)
+
+        # Logic: If count > trigger, probability = target / count. Else 1.0.
+        keep_probs = cp.where(
+            particle_counts > particle_triggers,
+            particle_targets / particle_counts,
+            1.0
+        )
+        
+        keep_mask = random_draws < keep_probs
+
+        # --- CONSERVATION STEP (Unchanged logic, utilizing updated mask) ---
+        
+        # Sum of weights per cell (Original)
+        mass_before = cp.bincount(k, weights=self.weight, minlength=num_cells)
+        
+        # Sum of weights of the *survivors* per cell
+        mass_survivors = cp.bincount(k, weights=(self.weight * keep_mask), minlength=num_cells)
+        
+        # Calculate scaling factors
+        scale_factors = cp.zeros_like(mass_before)
+        nonzero = mass_survivors > 0
+        scale_factors[nonzero] = mass_before[nonzero] / mass_survivors[nonzero]
+        
+        # Map factors back to particles
+        particle_scale_factors = scale_factors[k]
+        
+        # Apply changes
+        self.weight *= particle_scale_factors
+        
+        num_kept = int(cp.sum(keep_mask))
+        num_discarded = self.N - num_kept
+
+        if num_discarded > 0:
+            self.r = self.r[keep_mask]
+            self.z = self.z[keep_mask]
+            self.vr = self.vr[keep_mask]
+            self.vt = self.vt[keep_mask]
+            self.vz = self.vz[keep_mask]
+            self.weight = self.weight[keep_mask]
+            
             self.N = num_kept
             print(f"    Merged: Removed {num_discarded} particles. New N: {self.N}")
         else:
