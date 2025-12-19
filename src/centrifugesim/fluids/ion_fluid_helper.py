@@ -487,7 +487,7 @@ def compute_conductivities_kernel(sigma_P, sigma_par, ni, nu_i, beta_i, Z, q_e, 
 def update_Ti_joule_heating_kernel(Ti_out, Tn, Te, 
                                    Jer, Jez,            # Currents
                                    sigma_P, sigma_par,  # Conductivities
-                                   ni, nu_in, mi, mn, mask, kb, eps0, q_e, Z):
+                                   ni, nu_in, nu_ei, mi, mn, mask, kb, eps0, q_e, Z):
     """
     Updates Ion Temperature (Ti) using explicit Joule Heating (J*E) as the source.
     
@@ -499,9 +499,6 @@ def update_Ti_joule_heating_kernel(Ti_out, Tn, Te,
     Nr, Nz = Ti_out.shape
     
     me = constants.m_e
-    # Constant block for nu_ei (Electron-Ion)
-    factor_ei = (Z**2 * q_e**4) / (12.0 * np.pi * np.sqrt(np.pi) * eps0**2 * np.sqrt(me) * kb**1.5)
-    
     ratio_me_mi = me / mi
     ratio_mi_mn = mi / mn
 
@@ -526,18 +523,15 @@ def update_Ti_joule_heating_kernel(Ti_out, Tn, Te,
                     Q_joule = (Jer[i, j]**2 / s_p) + (Jez[i, j]**2 / s_par)
 
                     # --- 2. Electron-Ion Heat Transfer (Source/Sink) ---
-                    Te_local = max(Te[i, j], 0.1)
+                    Te_local = Te[i, j]
                     Tn_local = Tn[i, j]
                     
-                    # Calculate nu_ei
-                    lambda_D = np.sqrt((eps0 * kb * Te_local) / (n_local * q_e**2))
-                    b0 = (Z * q_e**2) / (12.0 * np.pi * eps0 * kb * Te_local)
-                    lnLambda = max(2.0, np.log(lambda_D / b0))
-                    nu_ei = factor_ei * n_local * lnLambda / (Te_local**1.5)
+                    # nu_ei
+                    nu_ei_local = nu_ei[i, j]
 
                     # Q_ie coeff: A * (Te - Ti)
                     # A = 3 * (me/mi) * n * nu_ei * kb
-                    A_coeff = 3.0 * ratio_me_mi * n_local * nu_ei * kb
+                    A_coeff = 3.0 * ratio_me_mi * n_local * nu_ei_local * kb
                     
                     # --- 3. Neutral Cooling (Sink) ---
                     # Q_in coeff: B * (Ti - Tn)
