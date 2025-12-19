@@ -332,3 +332,231 @@ def solve_vtheta_gs_sor(phi, Bz, sigma_P, mu, dr, dz, mask,
 
     info = {'iters': int(iters), 'last_update': float(last_update), 'residual_L2': float(res)}
     return v, info
+
+
+# Ions vtheta update kernel using momentum balance given by algebraic solution JxB - Drag = 0
+@jit(nopython=True, cache=True)
+def update_vtheta_kernel_algebraic(vtheta_out, Jer, Bz, ni, nu_in, un_theta, mask, mi):
+    """
+    Solves the steady-state algebraic momentum balance for Ion v_theta:
+    0 = (J x B) - Drag
+    v_theta_i = v_theta_n - (Jr * Bz) / (ni * mi * nu_in)
+    
+    Parameters:
+    -----------
+    vtheta_out : 2D array (Nr, Nz) to be updated in-place
+    Jer        : 2D array (Nr, Nz), Radial Current Density
+    Bz         : 2D array (Nr, Nz), Axial Magnetic Field
+    ni         : 2D array (Nr, Nz), Ion Density
+    nu_in      : 2D array (Nr, Nz), Ion-Neutral Collision Freq
+    un_theta   : 2D array (Nr, Nz), Neutral Gas Velocity
+    mask       : 2D array (Nr, Nz), 1=Plasma, 0=Solid
+    mi         : float, Ion Mass
+    """
+    Nr, Nz = Jer.shape
+    
+    for i in range(Nr):
+        for j in range(Nz):
+            if mask[i, j] == 1:
+                # Local scalar values
+                n_local = ni[i, j]
+                nu_local = nu_in[i, j]
+                                    
+                # Force calculation
+                # Lorentz Force term (assuming J_r x B_z -> -theta direction)
+                F_lorentz = -1.0 * Jer[i, j] * Bz[i, j]
+                    
+                # Drag coefficient = rho_i * nu_in
+                drag_coeff = mi * n_local * nu_local
+                    
+                # Algebraic Solution
+                vtheta_out[i, j] = un_theta[i, j] + (F_lorentz / drag_coeff)
+                    
+            else:
+                # Solid boundaries
+                vtheta_out[i, j] = 0.0
+
+@jit(nopython=True, cache=True)
+def compute_nu_i_kernel(nu_i_out, ni, Ti, nn, Tn, Z, mi, sigma_cx, mask, eps0, q_e, kb):
+    """
+    Computes total ion collision frequency: nu_i = nu_ii + nu_in
+    
+    nu_ii (Coulomb): Based on classical Spitzer formula components
+    nu_in (Charge Exchange): nn * sigma_cx * v_thermal_rel
+    """
+    Nr, Nz = nu_i_out.shape
+    
+    # --- Pre-calculate Physical Constants for nu_ii ---
+    # Coefficient for nu_ii = Z^4 * e^4 / (...) * n / T^1.5
+    # Standard SI derivation factor
+    factor_ii = (Z**4 * q_e**4) / (12.0 * np.pi * np.sqrt(np.pi) * eps0**2 * np.sqrt(mi) * kb**1.5)
+    
+    # --- Pre-calculate Constants for nu_in ---
+    # Relative thermal velocity factor: sqrt( 8*kB / (pi*mi) ) * sqrt(Ti + Tn)
+    # Assuming mi approx mn
+    factor_in = np.sqrt(8.0 * kb / (np.pi * mi))
+
+    min_T = 1.0 # Avoid division by zero temperature
+
+    for i in range(Nr):
+        for j in range(Nz):
+            if mask[i, j] == 1:
+                n_local = ni[i, j]
+                # Only compute if density is high enough to matter
+                if n_local > 1e10:
+                    
+                    # Local Temps
+                    Ti_val = max(Ti[i, j], min_T)
+                    Tn_val = max(Tn[i, j], min_T)
+                    nn_val = nn[i, j]
+
+                    # 1. Coulomb Collisions (nu_ii)
+                    # Calculate Debye Length for Coulomb Logarithm
+                    lambda_D = np.sqrt((eps0 * kb * Ti_val) / (n_local * q_e**2))
+                    # Classical impact parameter
+                    b0 = (Z * q_e**2) / (12.0 * np.pi * eps0 * kb * Ti_val)
+                    
+                    lnLambda = np.log(lambda_D / b0)
+                    if lnLambda < 2.0: lnLambda = 2.0 # Clamp minimum
+                    
+                    nu_ii = factor_ii * n_local * lnLambda / (Ti_val**1.5)
+
+                    # 2. Charge Exchange (nu_in)
+                    v_rel = factor_in * np.sqrt(Ti_val + Tn_val)
+                    nu_in = nn_val * sigma_cx * v_rel
+
+                    nu_i_out[i, j] = nu_ii + nu_in
+                else:
+                    nu_i_out[i, j] = 0.0
+            else:
+                nu_i_out[i, j] = 0.0
+
+@jit(nopython=True, cache=True)
+def compute_beta_i_kernel(beta_i_out, nu_i, Bz, Z, q_e, mi, mask):
+    """
+    Computes Ion Hall Parameter: beta_i = wci / nu_i
+    """
+    Nr, Nz = beta_i_out.shape
+    gyro_factor = (Z * q_e) / mi
+    
+    for i in range(Nr):
+        for j in range(Nz):
+            if mask[i, j] == 1:
+                nu = nu_i[i, j]
+                if nu > 1.0: # Avoid division by tiny numbers
+                    wci = gyro_factor * np.abs(Bz[i, j])
+                    beta_i_out[i, j] = wci / nu
+                else:
+                    beta_i_out[i, j] = 0.0
+            else:
+                beta_i_out[i, j] = 0.0
+
+@jit(nopython=True, cache=True)
+def compute_conductivities_kernel(sigma_P, sigma_par, ni, nu_i, beta_i, Z, q_e, mi, mask):
+    """
+    Computes:
+      sigma_parallel = (n * (Ze)^2) / (m * nu)
+      sigma_Pedersen = (n * (Ze)^2) / m * (nu / (nu^2 + wci^2))
+    """
+    Nr, Nz = sigma_P.shape
+    prefactor = (Z * q_e)**2 / mi
+    
+    for i in range(Nr):
+        for j in range(Nz):
+            if mask[i, j] == 1:
+                n = ni[i, j]
+                nu = nu_i[i, j]
+                beta = beta_i[i, j]
+                
+                if nu > 1e-5:
+                    # Parallel Conductivity
+                    s_par = (prefactor * n) / nu
+                    sigma_par[i, j] = s_par
+                    
+                    # Pedersen Conductivity
+                    # Relation: sigma_P = sigma_par / (1 + beta^2)
+                    sigma_P[i, j] = s_par / (1.0 + beta**2)
+                else:
+                    sigma_par[i, j] = 0.0
+                    sigma_P[i, j] = 0.0
+            else:
+                sigma_par[i, j] = 0.0
+                sigma_P[i, j] = 0.0
+
+@jit(nopython=True, cache=True)
+def update_Ti_joule_heating_kernel(Ti_out, Tn, Te, 
+                                   Jer, Jez,            # Currents
+                                   sigma_P, sigma_par,  # Conductivities
+                                   ni, nu_in, mi, mn, mask, kb, eps0, q_e, Z):
+    """
+    Updates Ion Temperature (Ti) using explicit Joule Heating (J*E) as the source.
+    
+    Balance:
+    (J_perp^2 / sigma_P) + (J_par^2 / sigma_par) + Q_ie = Q_in_thermal
+    
+    where Q_in_thermal = 3 * (mi/mn) * ni * nu_in * kb * (Ti - Tn)
+    """
+    Nr, Nz = Ti_out.shape
+    
+    me = constants.m_e
+    # Constant block for nu_ei (Electron-Ion)
+    factor_ei = (Z**2 * q_e**4) / (12.0 * np.pi * np.sqrt(np.pi) * eps0**2 * np.sqrt(me) * kb**1.5)
+    
+    ratio_me_mi = me / mi
+    ratio_mi_mn = mi / mn
+
+    min_sigma = 1e-6 # Avoid division by zero
+
+    for i in range(Nr):
+        for j in range(Nz):
+            if mask[i, j] == 1:
+                n_local = ni[i, j]
+                
+                if n_local > 1e10:
+                    # --- 1. Calculate Joule Heating (Source) ---
+                    # Assuming Jer is perpendicular (radial) and Jez is parallel (axial)
+                    # NOTE: If you have Br, strictly speaking Jez has a perp component,
+                    # but for typical Bz >> Br, this separation holds.
+                    
+                    s_p = max(sigma_P[i, j], min_sigma)
+                    s_par = max(sigma_par[i, j], min_sigma)
+                    
+                    # Q_joule = J_perp^2 / sigma_P + J_par^2 / sigma_par
+                    # Result is in Watts/m^3
+                    Q_joule = (Jer[i, j]**2 / s_p) + (Jez[i, j]**2 / s_par)
+
+                    # --- 2. Electron-Ion Heat Transfer (Source/Sink) ---
+                    Te_local = max(Te[i, j], 0.1)
+                    Tn_local = Tn[i, j]
+                    
+                    # Calculate nu_ei
+                    lambda_D = np.sqrt((eps0 * kb * Te_local) / (n_local * q_e**2))
+                    b0 = (Z * q_e**2) / (12.0 * np.pi * eps0 * kb * Te_local)
+                    lnLambda = max(2.0, np.log(lambda_D / b0))
+                    nu_ei = factor_ei * n_local * lnLambda / (Te_local**1.5)
+
+                    # Q_ie coeff: A * (Te - Ti)
+                    # A = 3 * (me/mi) * n * nu_ei * kb
+                    A_coeff = 3.0 * ratio_me_mi * n_local * nu_ei * kb
+                    
+                    # --- 3. Neutral Cooling (Sink) ---
+                    # Q_in coeff: B * (Ti - Tn)
+                    # B = 3 * (mi/mn) * n * nu_in * kb
+                    # Note: We use only the thermal relaxation part here
+                    nu_in_local = nu_in[i, j]
+                    B_coeff = 3.0 * ratio_mi_mn * n_local * nu_in_local * kb
+                    
+                    # --- 4. Solve Balance ---
+                    # Q_joule + A(Te - Ti) = B(Ti - Tn)
+                    # Q_joule + A*Te + B*Tn = (A + B) * Ti
+                    
+                    denom = A_coeff + B_coeff
+                    if denom > 1e-12:
+                        Ti_new = (Q_joule + A_coeff * Te_local + B_coeff * Tn_local) / denom
+                        Ti_out[i, j] = Ti_new
+                    else:
+                        Ti_out[i, j] = Tn_local
+                else:
+                    Ti_out[i, j] = Tn[i, j]
+            else:
+                Ti_out[i, j] = 300.0
