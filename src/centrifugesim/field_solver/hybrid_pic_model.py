@@ -39,13 +39,27 @@ class HybridPICModel:
         self.Er_grid_grad_pe = np.zeros((self.Nr, self.Nz)).astype(np.float64)
         self.Ez_grid_grad_pe = np.zeros((self.Nr, self.Nz)).astype(np.float64)
 
+        # Total conductivity components
+        self.sigma_P_grid = np.zeros((self.Nr, self.Nz)).astype(np.float64)
+        self.sigma_parallel_grid = np.zeros((self.Nr, self.Nz)).astype(np.float64)
+
         # electron current density components
         self.Jer_grid = np.zeros((self.Nr, self.Nz)).astype(np.float64)
         self.Jez_grid = np.zeros((self.Nr, self.Nz)).astype(np.float64)
 
+        # ion current density components
+        self.Jir_grid = np.zeros((self.Nr, self.Nz)).astype(np.float64)
+        self.Jiz_grid = np.zeros((self.Nr, self.Nz)).astype(np.float64)
+
+        # total current density components
+        self.Jr_grid = np.zeros((self.Nr, self.Nz)).astype(np.float64)
+        self.Jz_grid = np.zeros((self.Nr, self.Nz)).astype(np.float64)
+
         # q_ohm for electron energy equation
         self.q_ohm_grid = np.zeros((self.Nr, self.Nz)).astype(np.float64)
-        self.q_RF = np.zeros((self.Nr, self.Nz)).astype(np.float64)
+        self.q_ohm_ions_grid = np.zeros((self.Nr, self.Nz)).astype(np.float64)
+        self.q_ohm_electrons_grid = np.zeros((self.Nr, self.Nz)).astype(np.float64)
+        self.q_RF = np.zeros((self.Nr, self.Nz)).astype(np.float64) # electrons only
 
         self.Br_grid = np.zeros((self.Nr, self.Nz)).astype(np.float64)
         self.Bt_grid = np.zeros((self.Nr, self.Nz)).astype(np.float64)  # unused in solver; kept for pusher
@@ -85,8 +99,27 @@ class HybridPICModel:
         self.Br_grid_d = cp.asarray(self.Br_grid)
         self.Bz_grid_d = cp.asarray(self.Bz_grid)
 
+    def update_conductivities(self, electron_fluid, ion_fluid):
+        self.sigma_P_grid[:] = electron_fluid.sigma_P_grid + ion_fluid.sigma_P_grid
+        self.sigma_parallel_grid[:] = electron_fluid.sigma_parallel_grid + ion_fluid.sigma_parallel_grid
 
-    def compute_dphi_dz_cathode(self, geom:Geometry, I, electron_fluid, Jiz_grid=None, rmax_injection=None, sigma_r=None):
+    def update_Je_and_Ji_from_Jtotal(self, geom, electron_fluid, ion_fluid):
+        """
+        Updates self.Jer_grid, self.Jez_grid, self.Jir_grid, self.Jiz_grid
+        from total current density Jr_grid, Jz_grid and components of conductivity.
+        """
+        self.Jer_grid*=0.0
+        self.Jez_grid*=0.0
+        self.Jir_grid*=0.0
+        self.Jiz_grid*=0.0
+
+        self.Jer_grid[geom.mask==1] = (electron_fluid.sigma_P_grid[geom.mask==1] / (electron_fluid.sigma_P_grid[geom.mask==1] + ion_fluid.sigma_P_grid[geom.mask==1])) * self.Jr_grid[geom.mask==1]
+        self.Jez_grid[geom.mask==1] = (electron_fluid.sigma_parallel_grid[geom.mask==1] / (electron_fluid.sigma_parallel_grid[geom.mask==1] + ion_fluid.sigma_parallel_grid[geom.mask==1])) * self.Jz_grid[geom.mask==1]
+
+        self.Jir_grid[geom.mask==1] = self.Jr_grid[geom.mask==1] - self.Jer_grid[geom.mask==1]
+        self.Jiz_grid[geom.mask==1] = self.Jz_grid[geom.mask==1] - self.Jez_grid[geom.mask==1]
+        
+    def compute_dphi_dz_cathode(self, geom:Geometry, I, Jiz_grid=None, rmax_injection=None, sigma_r=None):
         # I is negative (enters cathode)
 
         # Should be input instead
@@ -103,7 +136,7 @@ class HybridPICModel:
         Jz0 = I / (2*np.pi*sigma_r**2)
         Jz_cathode = Jz0*np.exp(-0.5*geom.r[i_cathode]**2 / sigma_r**2)
 
-        sigma_parallel_cathode = electron_fluid.sigma_parallel_grid[i_cathode, j_cathode]
+        sigma_parallel_cathode = self.sigma_parallel_grid[i_cathode, j_cathode]
         
         # dphi_dz = (Jiz-Jz)/sigma_parallel + dpe/dz /(e*ne) at cathode
         dphi_dz_vec_aux = -Jz_cathode/sigma_parallel_cathode
@@ -113,9 +146,9 @@ class HybridPICModel:
             dphi_dz_vec_aux += Jiz_cathode/sigma_parallel_cathode
 
         # commenting out for now to avoid unstable behavior at cathode face
-        dpe_dz_cathode = (electron_fluid.pe_grid[i_cathode, j_cathode+1] - electron_fluid.pe_grid[i_cathode, j_cathode])/geom.dz
-        ne_cathode = electron_fluid.ne_grid[i_cathode, j_cathode]
-        dphi_dz_vec_aux += dpe_dz_cathode/(constants.q_e*ne_cathode)
+        #dpe_dz_cathode = (electron_fluid.pe_grid[i_cathode, j_cathode+1] - electron_fluid.pe_grid[i_cathode, j_cathode])/geom.dz
+        #ne_cathode = electron_fluid.ne_grid[i_cathode, j_cathode]
+        #dphi_dz_vec_aux += dpe_dz_cathode/(constants.q_e*ne_cathode)
         
         # flipping sign here due to how the solver was written
         dphi_dz_vec[i_cathode] = - dphi_dz_vec_aux 
@@ -140,8 +173,8 @@ class HybridPICModel:
         if(cathode_dirichlet):
             phi, info = solve_anisotropic_poisson_FV(
                 geom,
-                electron_fluid.sigma_P_grid,
-                electron_fluid.sigma_parallel_grid,
+                self.sigma_P_grid,
+                self.sigma_parallel_grid,
                 ne=electron_fluid.ne_grid,
                 pe=electron_fluid.pe_grid,
                 Bz=self.Bz_grid,
@@ -158,8 +191,8 @@ class HybridPICModel:
         else:
             phi, info = solve_anisotropic_poisson_FV(
                 geom,
-                electron_fluid.sigma_P_grid,
-                electron_fluid.sigma_parallel_grid,
+                self.sigma_P_grid,
+                self.sigma_parallel_grid,
                 ne=electron_fluid.ne_grid,
                 pe=electron_fluid.pe_grid,
                 Bz=self.Bz_grid,
@@ -173,9 +206,9 @@ class HybridPICModel:
                 verbose=verbose
             )
 
-        Er, Ez, Jer, Jez, Er_gradpe, Ez_gradpe = compute_E_and_J(phi, geom,
-                            electron_fluid.sigma_P_grid,
-                            electron_fluid.sigma_parallel_grid,
+        Er, Ez, Jr, Jz, Er_gradpe, Ez_gradpe = compute_E_and_J(phi, geom,
+                            self.sigma_P_grid,
+                            self.sigma_parallel_grid,
                             ne=electron_fluid.ne_grid,
                             pe=electron_fluid.pe_grid,
                             Bz=self.Bz_grid,
@@ -183,23 +216,29 @@ class HybridPICModel:
                             ne_floor=electron_fluid.ne_floor,
                             fill_solid_with_nan=False)
 
-        # TO DO: move to kernel
-        q_ohm = electron_fluid.sigma_P_grid*Er*Er + electron_fluid.sigma_parallel_grid*Ez*Ez
+        # TO DO q_ohm
+        #    move to kernel
+        #    separate between ions and electrons
+        q_ohm = self.sigma_P_grid*Er*Er + self.sigma_parallel_grid*Ez*Ez
 
         self.phi_grid = np.copy(phi)
         self.Er_grid = np.copy(Er)
         self.Ez_grid = np.copy(Ez)
         self.Er_grid_grad_pe = np.copy(Er_gradpe)
         self.Ez_grid_grad_pe = np.copy(Ez_gradpe)
-        self.Jer_grid = np.copy(Jer)
-        self.Jez_grid = np.copy(Jez)
+        self.Jr_grid = np.copy(Jr)
+        self.Jz_grid = np.copy(Jz)
         self.q_ohm_grid = np.copy(q_ohm)
-
 
         self.Er_grid_d = cp.asarray(self.Er_grid)
         self.Ez_grid_d = cp.asarray(self.Ez_grid)
 
-        del phi, Er, Ez, Jer, Jez, q_ohm
+        del phi, Er, Ez, Jr, Jz, q_ohm
+
+    def update_Ji_Ji_and_compute_DC_power_e_and_i(self, geom, electron_fluid, ion_fluid):
+        self.update_Je_and_Ji_from_Jtotal(geom, electron_fluid, ion_fluid)
+        self.q_ohm_ions_grid = ion_fluid.sigma_P_grid*self.Er_grid*self.Er_grid + ion_fluid.sigma_parallel_grid*self.Ez_grid*self.Ez_grid
+        self.q_ohm_electrons_grid = electron_fluid.sigma_P_grid*self.Er_grid*self.Er_grid + electron_fluid.sigma_parallel_grid*self.Ez_grid*self.Ez_grid
 
     # -------- Calculate electrodes currents
     def compute_electrode_currents(self, geom, return_parts=False):
@@ -229,8 +268,8 @@ class HybridPICModel:
             Individual contributions; only returned if return_parts=True.
         """
         # --- helpers ---------------------------------------------------------------
-        Jer = self.Jer_grid
-        Jez = self.Jez_grid
+        Jr = self.Jr_grid
+        Jz = self.Jz_grid
 
         twopi = 2.0 * np.pi
         Nr, Nz = geom.Nr, geom.Nz
@@ -276,13 +315,13 @@ class HybridPICModel:
         # Sample at the plasma side (above): iz = iz_zcath + 1 (clamped)
         iz_top_plasma = min(iz_zcath + 1, Nz - 1)
         r_slice_cath = slice(0, ir_rcath + 1)
-        I_cathode_z = trapz_r(twopi * geom.r[r_slice_cath] * Jez[r_slice_cath, iz_top_plasma], r_slice_cath)
+        I_cathode_z = trapz_r(twopi * geom.r[r_slice_cath] * Jz[r_slice_cath, iz_top_plasma], r_slice_cath)
 
         # Side face of the cathode rectangle: r = rmax_cathode, z in [0, zmax_cathode]
         # Plasma is at larger r, so sample at ir = ir_rcath + 1 (clamped)
         ir_side_plasma = min(ir_rcath + 1, Nr - 1)
         z_slice_cath = slice(0, iz_zcath + 1)
-        I_cathode_r = trapz_z(twopi * geom.rmax_cathode * Jer[ir_side_plasma, z_slice_cath], z_slice_cath)
+        I_cathode_r = trapz_z(twopi * geom.rmax_cathode * Jr[ir_side_plasma, z_slice_cath], z_slice_cath)
 
         I_cathode = I_cathode_z + I_cathode_r
         parts['I_cathode_z'] = I_cathode_z
@@ -292,15 +331,15 @@ class HybridPICModel:
         # Vertical inner face at r = rmin_anode, z in [zmin_anode, zmax_anode]:
         # Plasma is at smaller r, so take ir = ir_rminA (no +1)
         z_slice_A1 = slice(iz_zminA1, iz_zmaxA1 + 1)
-        I_a1_r = trapz_z(twopi * geom.rmin_anode * Jer[ir_rminA, z_slice_A1], z_slice_A1)
+        I_a1_r = trapz_z(twopi * geom.rmin_anode * Jr[ir_rminA, z_slice_A1], z_slice_A1)
 
         # Bottom face at z = zmin_anode, r in [rmin_anode, rmax]; plasma below -> sample at iz = iz_zminA1
         r_slice_A1 = slice(ir_rminA, ir_rmax + 1)
-        I_a1_zbot = trapz_r(twopi * geom.r[r_slice_A1] * Jez[r_slice_A1, iz_zminA1], r_slice_A1)
+        I_a1_zbot = trapz_r(twopi * geom.r[r_slice_A1] * Jz[r_slice_A1, iz_zminA1], r_slice_A1)
 
         # Top face at z = zmax_anode, r in [rmin_anode, rmax]; plasma above -> sample at iz = iz_zmaxA1 + 1; sign negative
         iz_A1_top_plasma = min(iz_zmaxA1 + 1, Nz - 1)
-        I_a1_ztop = -trapz_r(twopi * geom.r[r_slice_A1] * Jez[r_slice_A1, iz_A1_top_plasma], r_slice_A1)
+        I_a1_ztop = -trapz_r(twopi * geom.r[r_slice_A1] * Jz[r_slice_A1, iz_A1_top_plasma], r_slice_A1)
 
         parts['I_anode_1_r'] = I_a1_r
         parts['I_anode_1_zbot'] = I_a1_zbot
@@ -309,14 +348,14 @@ class HybridPICModel:
         # ------------------- Anode ring 2 -------------------
         # Vertical inner face at r = rmin_anode, z in [zmin_anode2, zmax_anode2]
         z_slice_A2 = slice(iz_zminA2, iz_zmaxA2 + 1)
-        I_a2_r = trapz_z(twopi * geom.rmin_anode * Jer[ir_rminA, z_slice_A2], z_slice_A2)
+        I_a2_r = trapz_z(twopi * geom.rmin_anode * Jr[ir_rminA, z_slice_A2], z_slice_A2)
 
         # Bottom face at z = zmin_anode2, r in [rmin_anode, rmax]; plasma below
-        I_a2_zbot = trapz_r(twopi * geom.r[r_slice_A1] * Jez[r_slice_A1, iz_zminA2], r_slice_A1)
+        I_a2_zbot = trapz_r(twopi * geom.r[r_slice_A1] * Jz[r_slice_A1, iz_zminA2], r_slice_A1)
 
         # Top face at z = zmax_anode2, r in [rmin_anode, rmax]; plasma above -> sample at iz = iz_zmaxA2 + 1; negative sign
         iz_A2_top_plasma = min(iz_zmaxA2 + 1, Nz - 1)
-        I_a2_ztop = -trapz_r(twopi * geom.r[r_slice_A1] * Jez[r_slice_A1, iz_A2_top_plasma], r_slice_A1)
+        I_a2_ztop = -trapz_r(twopi * geom.r[r_slice_A1] * Jz[r_slice_A1, iz_A2_top_plasma], r_slice_A1)
 
         parts['I_anode_2_r'] = I_a2_r
         parts['I_anode_2_zbot'] = I_a2_zbot
@@ -329,14 +368,14 @@ class HybridPICModel:
         I_awall_1 = 0.0
         if z_stop > z_start:
             z_slice_w1 = slice(z_start, z_stop)
-            I_awall_1 = trapz_z(twopi * geom.rmax * Jer[ir_rmax, z_slice_w1], z_slice_w1)
+            I_awall_1 = trapz_z(twopi * geom.rmax * Jr[ir_rmax, z_slice_w1], z_slice_w1)
 
         # Segment after ring 2: z in (zmax_anode2, zmax]
         z_start2 = min(iz_zmaxA2 + 1, Nz - 1)
         z_slice_w2 = slice(z_start2, Nz)
         I_awall_2 = 0.0
         if z_start2 < Nz:
-            I_awall_2 = trapz_z(twopi * geom.rmax * Jer[ir_rmax, z_slice_w2], z_slice_w2)
+            I_awall_2 = trapz_z(twopi * geom.rmax * Jr[ir_rmax, z_slice_w2], z_slice_w2)
 
         parts['I_anode_wall_between'] = I_awall_1
         parts['I_anode_wall_top'] = I_awall_2

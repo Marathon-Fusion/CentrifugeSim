@@ -162,11 +162,9 @@ def grad_z_masked(f, dz, out, face_z):
             else:
                 out[i,k] = 0.0
 
-
 def stable_dt(fluid, r, dr, dz,
               ur, uz, c_field,
               mu, rho,
-              rho_i, nu_in, nu_cx,
               kappa=None, c_v=None,
               safety=0.5):
     # advection/acoustics
@@ -188,11 +186,7 @@ def stable_dt(fluid, r, dr, dz,
         if alpha_max > 0:
             dt_cond = 0.25 * min(dr*dr, dz*dz) / alpha_max
 
-    # explicit ion–neutral drag
-    nu_eff = np.max((nu_in + nu_cx)[fluid==1] * rho_i[fluid==1] / np.maximum(rho[fluid==1], 1e-30))
-    dt_drag = np.inf if nu_eff == 0 else 1.0 / nu_eff
-
-    dt = safety * min(dt_adv, dt_visc, dt_cond, dt_drag)
+    dt = safety * min(dt_adv, dt_visc, dt_cond)
     return dt if np.isfinite(dt) else 1e-6
 
 # ---------- Rusanov (LLF) flux for scalar advection in RZ ----------

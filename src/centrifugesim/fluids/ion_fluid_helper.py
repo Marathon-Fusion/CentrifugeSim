@@ -1,6 +1,8 @@
 import numpy as np
 from numba import njit
 
+from centrifugesim import constants
+
 # -------------------------
 # Boundary conditions
 # -------------------------
@@ -335,8 +337,8 @@ def solve_vtheta_gs_sor(phi, Bz, sigma_P, mu, dr, dz, mask,
 
 
 # Ions vtheta update kernel using momentum balance given by algebraic solution JxB - Drag = 0
-@jit(nopython=True, cache=True)
-def update_vtheta_kernel_algebraic(vtheta_out, Jer, Bz, ni, nu_in, un_theta, mask, mi):
+@njit(cache=True)
+def update_vtheta_kernel_algebraic(vtheta_out, Jr, Bz, ni, nu_in, un_theta, mask, mi):
     """
     Solves the steady-state algebraic momentum balance for Ion v_theta:
     0 = (J x B) - Drag
@@ -345,7 +347,7 @@ def update_vtheta_kernel_algebraic(vtheta_out, Jer, Bz, ni, nu_in, un_theta, mas
     Parameters:
     -----------
     vtheta_out : 2D array (Nr, Nz) to be updated in-place
-    Jer        : 2D array (Nr, Nz), Radial Current Density
+    Jr         : 2D array (Nr, Nz), Total radial Current Density
     Bz         : 2D array (Nr, Nz), Axial Magnetic Field
     ni         : 2D array (Nr, Nz), Ion Density
     nu_in      : 2D array (Nr, Nz), Ion-Neutral Collision Freq
@@ -353,7 +355,7 @@ def update_vtheta_kernel_algebraic(vtheta_out, Jer, Bz, ni, nu_in, un_theta, mas
     mask       : 2D array (Nr, Nz), 1=Plasma, 0=Solid
     mi         : float, Ion Mass
     """
-    Nr, Nz = Jer.shape
+    Nr, Nz = Jr.shape
     
     for i in range(Nr):
         for j in range(Nz):
@@ -364,7 +366,7 @@ def update_vtheta_kernel_algebraic(vtheta_out, Jer, Bz, ni, nu_in, un_theta, mas
                                     
                 # Force calculation
                 # Lorentz Force term (assuming J_r x B_z -> -theta direction)
-                F_lorentz = -1.0 * Jer[i, j] * Bz[i, j]
+                F_lorentz = -1.0 * Jr[i, j] * Bz[i, j]
                     
                 # Drag coefficient = rho_i * nu_in
                 drag_coeff = mi * n_local * nu_local
@@ -376,8 +378,8 @@ def update_vtheta_kernel_algebraic(vtheta_out, Jer, Bz, ni, nu_in, un_theta, mas
                 # Solid boundaries
                 vtheta_out[i, j] = 0.0
 
-@jit(nopython=True, cache=True)
-def compute_nu_i_kernel(nu_i_out, ni, Ti, nn, Tn, Z, mi, sigma_cx, mask, eps0, q_e, kb):
+@njit(cache=True)
+def compute_nu_i_kernel(nu_i_out, ni, Ti, nn, Tn, Z, mi, sigma_cx, mask):
     """
     Computes total ion collision frequency: nu_i = nu_ii + nu_in
     
@@ -386,17 +388,15 @@ def compute_nu_i_kernel(nu_i_out, ni, Ti, nn, Tn, Z, mi, sigma_cx, mask, eps0, q
     """
     Nr, Nz = nu_i_out.shape
     
-    # --- Pre-calculate Physical Constants for nu_ii ---
-    # Coefficient for nu_ii = Z^4 * e^4 / (...) * n / T^1.5
-    # Standard SI derivation factor
-    factor_ii = (Z**4 * q_e**4) / (12.0 * np.pi * np.sqrt(np.pi) * eps0**2 * np.sqrt(mi) * kb**1.5)
-    
+    # Physical Constants
+    kb = constants.kb    
+
     # --- Pre-calculate Constants for nu_in ---
     # Relative thermal velocity factor: sqrt( 8*kB / (pi*mi) ) * sqrt(Ti + Tn)
     # Assuming mi approx mn
     factor_in = np.sqrt(8.0 * kb / (np.pi * mi))
 
-    min_T = 1.0 # Avoid division by zero temperature
+    min_T = 300.0 # Avoid division by zero temperature
 
     for i in range(Nr):
         for j in range(Nz):
@@ -410,28 +410,17 @@ def compute_nu_i_kernel(nu_i_out, ni, Ti, nn, Tn, Z, mi, sigma_cx, mask, eps0, q
                     Tn_val = max(Tn[i, j], min_T)
                     nn_val = nn[i, j]
 
-                    # 1. Coulomb Collisions (nu_ii)
-                    # Calculate Debye Length for Coulomb Logarithm
-                    lambda_D = np.sqrt((eps0 * kb * Ti_val) / (n_local * q_e**2))
-                    # Classical impact parameter
-                    b0 = (Z * q_e**2) / (12.0 * np.pi * eps0 * kb * Ti_val)
-                    
-                    lnLambda = np.log(lambda_D / b0)
-                    if lnLambda < 2.0: lnLambda = 2.0 # Clamp minimum
-                    
-                    nu_ii = factor_ii * n_local * lnLambda / (Ti_val**1.5)
-
                     # 2. Charge Exchange (nu_in)
                     v_rel = factor_in * np.sqrt(Ti_val + Tn_val)
                     nu_in = nn_val * sigma_cx * v_rel
 
-                    nu_i_out[i, j] = nu_ii + nu_in
+                    nu_i_out[i, j] = nu_in
                 else:
                     nu_i_out[i, j] = 0.0
             else:
                 nu_i_out[i, j] = 0.0
 
-@jit(nopython=True, cache=True)
+@njit(cache=True)
 def compute_beta_i_kernel(beta_i_out, nu_i, Bz, Z, q_e, mi, mask):
     """
     Computes Ion Hall Parameter: beta_i = wci / nu_i
@@ -451,7 +440,7 @@ def compute_beta_i_kernel(beta_i_out, nu_i, Bz, Z, q_e, mi, mask):
             else:
                 beta_i_out[i, j] = 0.0
 
-@jit(nopython=True, cache=True)
+@njit(cache=True)
 def compute_conductivities_kernel(sigma_P, sigma_par, ni, nu_i, beta_i, Z, q_e, mi, mask):
     """
     Computes:
@@ -483,11 +472,10 @@ def compute_conductivities_kernel(sigma_P, sigma_par, ni, nu_i, beta_i, Z, q_e, 
                 sigma_par[i, j] = 0.0
                 sigma_P[i, j] = 0.0
 
-@jit(nopython=True, cache=True)
+@njit(cache=True)
 def update_Ti_joule_heating_kernel(Ti_out, Tn, Te, 
-                                   Jer, Jez,            # Currents
-                                   sigma_P, sigma_par,  # Conductivities
-                                   ni, nu_in, nu_ei, mi, mn, mask, kb, eps0, q_e, Z):
+                                   Q_Joule_ions,
+                                   ni, nu_in, nu_ei, mi, mn, mask, me, kb):
     """
     Updates Ion Temperature (Ti) using explicit Joule Heating (J*E) as the source.
     
@@ -498,11 +486,8 @@ def update_Ti_joule_heating_kernel(Ti_out, Tn, Te,
     """
     Nr, Nz = Ti_out.shape
     
-    me = constants.m_e
     ratio_me_mi = me / mi
     ratio_mi_mn = mi / mn
-
-    min_sigma = 1e-6 # Avoid division by zero
 
     for i in range(Nr):
         for j in range(Nz):
@@ -510,18 +495,9 @@ def update_Ti_joule_heating_kernel(Ti_out, Tn, Te,
                 n_local = ni[i, j]
                 
                 if n_local > 1e10:
-                    # --- 1. Calculate Joule Heating (Source) ---
-                    # Assuming Jer is perpendicular (radial) and Jez is parallel (axial)
-                    # NOTE: If you have Br, strictly speaking Jez has a perp component,
-                    # but for typical Bz >> Br, this separation holds.
-                    
-                    s_p = max(sigma_P[i, j], min_sigma)
-                    s_par = max(sigma_par[i, j], min_sigma)
-                    
-                    # Q_joule = J_perp^2 / sigma_P + J_par^2 / sigma_par
-                    # Result is in Watts/m^3
-                    Q_joule = (Jer[i, j]**2 / s_p) + (Jez[i, j]**2 / s_par)
-
+                    # --- 1. Joule Heating (Source) ---
+                    Q_joule = Q_Joule_ions[i, j]
+                   
                     # --- 2. Electron-Ion Heat Transfer (Source/Sink) ---
                     Te_local = Te[i, j]
                     Tn_local = Tn[i, j]
@@ -554,3 +530,105 @@ def update_Ti_joule_heating_kernel(Ti_out, Tn, Te,
                     Ti_out[i, j] = Tn[i, j]
             else:
                 Ti_out[i, j] = 300.0
+
+@njit(cache=True)
+def solve_vtheta_viscous_SOR(vtheta, Jr, Bz, ni, nu_in, un_theta, eta, 
+                             mask, dr, dz, r_coords, mi, 
+                             max_iter=2000, tol=1e-5, omega=1.4):
+    """
+    Solves steady-state viscous momentum equation using SOR (Successive Over-Relaxation).
+    
+    Equation: 
+      0 = F_lorentz - Drag + Viscosity
+      F_lorentz = -Jr * Bz
+      Drag = rho * nu * (v_i - v_n)
+      Viscous = eta * [ d2v/dr2 + (1/r)dv/dr - v/r^2 + d2v/dz2 ] 
+                (Simplified Laplacian form for cylindrical vector)
+    
+    Boundary Conditions:
+      - Mask=0 (Walls/Internal): v = 0
+      - r=0 (Axis): v = 0
+      - z=0 (Inlet): v = 0
+      - z=L (Outlet): dv/dz = 0 (v_last = v_second_last)
+    """
+    Nr, Nz = vtheta.shape
+    
+    # 1. Pre-Clean Solids
+    for i in range(Nr):
+        for j in range(Nz):
+            if mask[i, j] == 0:
+                vtheta[i, j] = 0.0
+            if i == 0 or i == Nr - 1 or j == 0: # Domain boundaries
+                vtheta[i, j] = 0.0
+
+    # Geometric factors
+    inv_dr2 = 1.0 / (dr * dr)
+    inv_dz2 = 1.0 / (dz * dz)
+    inv_2dr = 1.0 / (2.0 * dr)
+    
+    for k in range(max_iter):
+        max_diff = 0.0
+        
+        for i in range(1, Nr - 1): 
+            r_local = r_coords[i]
+            inv_r = 1.0 / r_local
+            inv_r2 = inv_r * inv_r
+            
+            for j in range(1, Nz - 1): 
+                
+                # Check 1: Is this plasma?
+                if mask[i, j] == 1:
+                    
+                    # Check 2: Is it TOUCHING a wall? (The "Padding" Fix)
+                    # If any neighbor is 0 (Solid), force this node to 0 (No-Slip Wall)
+                    if (mask[i+1, j] == 0 or mask[i-1, j] == 0 or 
+                        mask[i, j+1] == 0 or mask[i, j-1] == 0):
+                        
+                        vtheta[i, j] = 0.0
+                        continue # Skip to next node
+                    
+                    # --- Standard Physics Solver for Bulk Plasma ---
+                    
+                    n_loc = ni[i, j]
+                    nu_loc = nu_in[i, j]
+                    eta_loc = eta[i, j]
+                    
+                    # Physics Terms
+                    C_drag = mi * n_loc * nu_loc
+                    F_L = -1.0 * Jr[i, j] * Bz[i, j]
+                    
+                    # Neighbors
+                    v_ip = vtheta[i+1, j]
+                    v_im = vtheta[i-1, j]
+                    v_jp = vtheta[i, j+1]
+                    v_jm = vtheta[i, j-1]
+                    
+                    # Discretization
+                    visc_r_part = eta_loc * ( (v_ip + v_im) * inv_dr2 + (v_ip - v_im) * inv_2dr * inv_r )
+                    visc_z_part = eta_loc * ( (v_jp + v_jm) * inv_dz2 )
+                    
+                    RHS = F_L + (C_drag * un_theta[i, j]) + visc_r_part + visc_z_part
+                    Coeff = C_drag + eta_loc * (2.0*inv_dr2 + 2.0*inv_dz2 + inv_r2)
+                    
+                    if Coeff > 1e-20:
+                        v_star = RHS / Coeff
+                        diff = abs(v_star - vtheta[i, j])
+                        vtheta[i, j] = (1.0 - omega) * vtheta[i, j] + omega * v_star
+                        if diff > max_diff:
+                            max_diff = diff
+                            
+                else:
+                    # Solid Node
+                    vtheta[i, j] = 0.0
+        
+        # --- Boundaries (Neumann Z-Max) ---
+        for i in range(Nr):
+            if mask[i, Nz-1] == 1:
+                # Only copy if NOT touching a side wall
+                if mask[i+1, Nz-1] == 1 and mask[i-1, Nz-1] == 1:
+                    vtheta[i, Nz-1] = vtheta[i, Nz-2]
+                else:
+                    vtheta[i, Nz-1] = 0.0
+        
+        if max_diff < tol:
+            break
