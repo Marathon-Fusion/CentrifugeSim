@@ -511,11 +511,11 @@ def apply_townsend_ionization_sheath(p_grid,
 # use electron fluid ne_floor instead
 @njit(cache=True)
 def time_advance_ne_analytic_kernel_anisotropic(ne_out, ne_old, 
-                                                nu_iz, nu_loss, beta_rec, 
+                                                nu_iz, nu_loss, nu_RR, beta_rec, 
                                                 dt, mask):
     """
     Solves the logistic growth/decay equation analytically for density:
-        dn/dt = (nu_iz - nu_loss) * n - beta_rec * n^2
+        dn/dt = (nu_iz - nu_loss - nu_RR) * n - beta_rec * n^2
     
     This kernel is 'unconditionally stable' (it will not oscillate or explode 
     even if dt is very large). It automatically detects if dt is large enough 
@@ -527,6 +527,7 @@ def time_advance_ne_analytic_kernel_anisotropic(ne_out, ne_old,
     ne_old   : Input array (Nr, Nz) - Previous density
     nu_iz    : Input array (Nr, Nz) - Ionization frequency [1/s]
     nu_loss  : Input array (Nr, Nz) - Diffusive loss rate [1/s] (calculated externally)
+    nu_RR    : Input array (Nr, Nz) - Radiative recombination frequency [1/s]
     beta_rec : Input array (Nr, Nz) - Recombination coeff [m^3/s]
     dt       : float - Time step [s]
     mask     : Input array (Nr, Nz) - 1=Plasma, 0=Solid
@@ -547,7 +548,7 @@ def time_advance_ne_analytic_kernel_anisotropic(ne_out, ne_old,
                 
                 # 1. Net Linear Growth Rate (alpha)
                 # alpha = Production - Loss
-                alpha = nu_iz[i, j] - nu_loss[i, j]
+                alpha = nu_iz[i, j] - nu_loss[i, j] - nu_RR[i, j]
                 
                 beta = beta_rec[i, j]
                 

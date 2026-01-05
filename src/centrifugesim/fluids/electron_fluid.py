@@ -155,7 +155,12 @@ class ElectronFluidContainer:
         self.beta_e_grid[:]         = _beta_e
 
     def update_Te(self, geom, hybrid_pic, neutral_fluid, particle_container, Ts_host, Q_Joule_grid, dt, p_RF=None):
-        "Update Te function solving energy equation"
+        """
+        Update Te function solving energy equation
+        Note: this is an explicit solver with substepping for stability used in first version of code
+        It requires a small timestep.
+        Next version will use semi-implicit solver instead to reduce computational cost.
+        """
         Te_new = np.zeros_like(self.Te_grid)
 
         # Effective thermal diffusivity for electrons from parallel conductivity
@@ -276,14 +281,15 @@ class ElectronFluidContainer:
             neutral_fluid.T_n_grid[geom.mask==1] += dt_sub*Q_coll_en[geom.mask==1]/(3/2*constants.kb*nn[geom.mask==1])
 
 
-    def update_density_implicit(self, geom, ion_fluid, chemistry, dt):
+    def update_density_implicit(self, geom, ion_fluid, nu_iz_grid, nu_RR_recomb_grid, beta_rec_grid, dt):
         """
         Updates ne using the Analytic Logistic Solution with Anisotropic Diffusion.
         """
         
         # 1. Fetch Rates (Inputs from Chemistry)
-        nu_iz = chemistry.nu_iz_grid      # [1/s]
-        beta_rec = chemistry.beta_rec_grid # [m^3/s]
+        nu_iz = nu_iz_grid      # [1/s]
+        nu_RR = nu_RR_recomb_grid  # [1/s] (Radiative Recomb)
+        beta_rec = beta_rec_grid # [m^3/s]
         
         # 2. Geometric Loss Factors (Pre-calculated Scalars)
         # R_max and L_z define the fundamental diffusion mode
@@ -316,6 +322,7 @@ class ElectronFluidContainer:
             self.ne_grid,       # Input (Old)
             nu_iz,              # Ionization Source
             nu_diff_grid,       # Calculated Anisotropic Loss
+            nu_RR,              # Radiative Recombination Loss
             beta_rec,           # Recombination Sink
             dt,                 # Timestep
             geom.mask
@@ -328,7 +335,7 @@ class ElectronFluidContainer:
         self.ne_grid = 10**(log_old + relax * (log_new - log_old))
 
 
-    def update_Te_implicit(self, geom, hybrid_pic, neutral_fluid, ion_fluid, chemistry, dt):
+    def update_Te_implicit(self, geom, hybrid_pic, neutral_fluid, ion_fluid, nu_iz_grid, dt):
         """
         Implicit update for Electron Temperature.
         Allows large timesteps by splitting Local Physics and Global Transport.
@@ -353,7 +360,7 @@ class ElectronFluidContainer:
             ion_fluid.Ti_grid,
             self.nu_en_grid,
             self.nu_ei_grid,
-            chemistry.nu_iz_grid, # From Chemistry
+            nu_iz_grid,
             self.Q_Joule_grid,    # Ensure this is pre-calculated!
             E_cost_J,
             dt,
