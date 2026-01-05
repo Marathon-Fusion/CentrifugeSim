@@ -62,6 +62,8 @@ class IonFluidContainer:
     def update_vtheta(self, geom, hybrid_pic, neutral_fluid):
         """
         Updates self.vtheta using the algebraic approximation (Drag = JxB).
+        TO DO:
+            - Extend to include Jz x Br term for coil geometry.
         """
         ion_fluid_helper.update_vtheta_kernel_algebraic(
             self.vi_theta_grid,           # Output
@@ -78,6 +80,10 @@ class IonFluidContainer:
         """
         Updates self.vtheta by solving the full Viscous-Resistive-inertial balance.
         Uses the existing self.vtheta as the initial guess for the iterative solver.
+        Note:
+            - self.eta_0 is small so ion viscosity seems to have little effect.
+            recommend instantanous (algebraic) update for now. Double check once
+            fully integrated
         """
         
         # Call the SOR solver
@@ -101,7 +107,7 @@ class IonFluidContainer:
 
     def update_collision_frequencies(self, geom, neutral_fluid):
         """
-        Calculates nu_i = nu_ii (Coulomb) + nu_in (Charge Exchange).
+        Calculates nu_i = nu_in (Charge Exchange).
         """            
         ion_fluid_helper.compute_nu_i_kernel(
             self.nu_i_grid,    # Output

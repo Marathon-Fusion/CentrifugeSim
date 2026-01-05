@@ -382,8 +382,7 @@ def update_vtheta_kernel_algebraic(vtheta_out, Jr, Bz, ni, nu_in, un_theta, mask
 def compute_nu_i_kernel(nu_i_out, ni, Ti, nn, Tn, Z, mi, sigma_cx, mask):
     """
     Computes total ion collision frequency: nu_i = nu_ii + nu_in
-    
-    nu_ii (Coulomb): Based on classical Spitzer formula components
+    Currently only includes nu_in via charge exchange.
     nu_in (Charge Exchange): nn * sigma_cx * v_thermal_rel
     """
     Nr, Nz = nu_i_out.shape
