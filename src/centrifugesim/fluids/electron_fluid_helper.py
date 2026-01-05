@@ -505,3 +505,151 @@ def apply_townsend_ionization_sheath(p_grid,
             dni_Townsend[i, j] = S_vol * dt
 
     return dni_Townsend
+
+
+# TO DO:
+# use electron fluid ne_floor instead
+@njit(cache=True)
+def time_advance_ne_analytic_kernel_anisotropic(ne_out, ne_old, 
+                                                nu_iz, nu_loss, beta_rec, 
+                                                dt, mask):
+    """
+    Solves the logistic growth/decay equation analytically for density:
+        dn/dt = (nu_iz - nu_loss) * n - beta_rec * n^2
+    
+    This kernel is 'unconditionally stable' (it will not oscillate or explode 
+    even if dt is very large). It automatically detects if dt is large enough 
+    to jump straight to equilibrium.
+
+    Parameters
+    ----------
+    ne_out   : Output array (Nr, Nz)
+    ne_old   : Input array (Nr, Nz) - Previous density
+    nu_iz    : Input array (Nr, Nz) - Ionization frequency [1/s]
+    nu_loss  : Input array (Nr, Nz) - Diffusive loss rate [1/s] (calculated externally)
+    beta_rec : Input array (Nr, Nz) - Recombination coeff [m^3/s]
+    dt       : float - Time step [s]
+    mask     : Input array (Nr, Nz) - 1=Plasma, 0=Solid
+    """
+    Nr, Nz = ne_out.shape
+    
+    # Exponent cap to prevent float64 overflow (exp(709) is max)
+    # We use 100 as a safe "infinity" threshold. exp(100) is ~2e43.
+    EXP_LIMIT = 100.0 
+    
+    # Minimum density floor to prevent div-by-zero or negative densities
+    NE_FLOOR = 1e10 
+    
+    for i in range(Nr):
+        for j in range(Nz):
+            if mask[i, j] == 1:
+                n0 = max(ne_old[i, j], NE_FLOOR)
+                
+                # 1. Net Linear Growth Rate (alpha)
+                # alpha = Production - Loss
+                alpha = nu_iz[i, j] - nu_loss[i, j]
+                
+                beta = beta_rec[i, j]
+                
+                # --- CASE A: DECAY (alpha < 0) ---
+                # The plasma is cooling/dying. 
+                # Equation behaves like: n(t) -> 0
+                if alpha < -1e-20:
+                    # Check for underflow (if decay is too fast)
+                    # arg is negative
+                    arg = alpha * dt
+                    
+                    if arg < -EXP_LIMIT:
+                        # Decayed effectively to zero (floor)
+                        ne_out[i, j] = NE_FLOOR
+                    else:
+                        # Full Logistic Decay Solution
+                        # (Formula is same as growth, but alpha is negative)
+                        exp_factor = np.exp(arg) # < 1.0
+                        
+                        if beta > 1e-30:
+                            numerator = n0 * exp_factor
+                            # Denom can't be zero because alpha is negative and beta > 0
+                            denominator = 1.0 + (n0 * beta / alpha) * (exp_factor - 1.0)
+                            
+                            # Safety check for denominator
+                            if abs(denominator) > 1e-15:
+                                ne_out[i, j] = numerator / denominator
+                            else:
+                                ne_out[i, j] = NE_FLOOR
+                        else:
+                            # Pure exponential decay
+                            ne_out[i, j] = n0 * exp_factor
+
+                # --- CASE B: GROWTH (alpha > 0) ---
+                # The plasma is ionizing.
+                # Equation behaves like: n(t) -> alpha / beta
+                else:
+                    arg = alpha * dt
+                    
+                    # 1. Check for Equilibrium (Large dt or fast rate)
+                    if arg > EXP_LIMIT:
+                        # We assume t -> infinity.
+                        # Equilibrium = alpha / beta
+                        if beta > 1e-30:
+                            ne_out[i, j] = alpha / beta
+                        else:
+                            # Beta is 0 (No recombination) -> Runaway growth!
+                            # Cap it to avoid infinity (e.g., 100x current value or some physics limit)
+                            ne_out[i, j] = n0 * 100.0 
+                    
+                    # 2. Standard Time Advance
+                    else:
+                        exp_factor = np.exp(arg) # > 1.0
+                        
+                        if beta > 1e-30:
+                             numerator = n0 * exp_factor
+                             denominator = 1.0 + (n0 * beta / alpha) * (exp_factor - 1.0)
+                             ne_out[i, j] = numerator / denominator
+                        else:
+                             # Pure exponential growth (no recombination)
+                             ne_out[i, j] = n0 * exp_factor
+                             
+                # Final safety clamp
+                if ne_out[i, j] < NE_FLOOR: 
+                    ne_out[i, j] = NE_FLOOR
+                
+            else:
+                # Masked Region (Solid)
+                ne_out[i, j] = NE_FLOOR
+
+
+@njit(cache=True)
+def compute_ambipolar_loss_rate_anisotropic(Te, Ti, nu_in, beta_e, beta_i, 
+                                            mi, kb, 
+                                            inv_Lambda_z_sq, inv_Lambda_r_sq):
+    """
+    Computes the effective diffusive loss rate [1/s] accounting for magnetization.
+    
+    nu_diff = (Da_par * inv_Lambda_z^2) + (Da_perp * inv_Lambda_r^2)
+    
+    where:
+      Da_par  = kb*(Te+Ti) / (mi*nu_in)
+      Da_perp = Da_par / (1 + beta_e * beta_i)
+    """
+    Nr, Nz = Te.shape
+    nu_loss = np.zeros_like(Te)
+    
+    for i in range(Nr):
+        for j in range(Nz):
+            # 1. Parallel Ambipolar Diffusion (Classical)
+            # nu_in floor to avoid infinity
+            nu_safe = max(nu_in[i, j], 1e-5)
+            
+            Da_par = (kb * (Te[i, j] + Ti[i, j])) / (mi * nu_safe)
+            
+            # 2. Perpendicular Ambipolar Diffusion (Magnetized)
+            # Simon Short-Circuit / Classical Ambipolar scaling
+            magnetization_factor = 1.0 + beta_e[i, j] * beta_i[i, j]
+            Da_perp = Da_par / magnetization_factor
+            
+            # 3. Total Geometric Loss Rate
+            # Loss = D_par/Lz^2 + D_perp/Lr^2
+            nu_loss[i, j] = (Da_par * inv_Lambda_z_sq) + (Da_perp * inv_Lambda_r_sq)
+            
+    return nu_loss

@@ -275,6 +275,58 @@ class ElectronFluidContainer:
             neutral_fluid.T_n_grid[geom.mask==1] += dt_sub*Q_coll_en[geom.mask==1]/(3/2*constants.kb*nn[geom.mask==1])
 
 
+    def update_density_implicit(self, geom, ion_fluid, chemistry, dt):
+        """
+        Updates ne using the Analytic Logistic Solution with Anisotropic Diffusion.
+        """
+        
+        # 1. Fetch Rates (Inputs from Chemistry)
+        nu_iz = chemistry.nu_iz_grid      # [1/s]
+        beta_rec = chemistry.beta_rec_grid # [m^3/s]
+        
+        # 2. Geometric Loss Factors (Pre-calculated Scalars)
+        # R_max and L_z define the fundamental diffusion mode
+        R_max = geom.r.max()
+        L_z = geom.z.max() - geom.z.min()
+        
+        # 1/L^2 factors
+        inv_Lambda_r_sq = (2.405 / R_max)**2
+        inv_Lambda_z_sq = (np.pi / (2.0 * L_z))**2
+        
+        # 3. Compute Effective Loss Rate (Anisotropic)
+        # This returns a GRID of loss frequencies [1/s]
+        nu_diff_grid = electron_fluid_helper.compute_ambipolar_loss_rate_anisotropic(
+            self.Te_grid,
+            ion_fluid.Ti_grid,
+            ion_fluid.nu_i_grid,    # Ion-Neutral Collisions (dominates drag)
+            self.beta_e_grid,       # Electron Magnetization
+            ion_fluid.beta_i_grid,  # Ion Magnetization
+            ion_fluid.m_i,          # Ion Mass
+            constants.kb,
+            inv_Lambda_z_sq,        # Axial geometric factor
+            inv_Lambda_r_sq         # Radial geometric factor
+        )
+        
+        # 4. Call the Anisotropic Analytic Kernel
+        ne_new = np.zeros_like(self.ne_grid)
+        
+        electron_fluid_helper.time_advance_ne_analytic_kernel_anisotropic(
+            ne_new,             # Output
+            self.ne_grid,       # Input (Old)
+            nu_iz,              # Ionization Source
+            nu_diff_grid,       # Calculated Anisotropic Loss
+            beta_rec,           # Recombination Sink
+            dt,                 # Timestep
+            geom.mask
+        )
+        
+        # 5. Apply Under-Relaxation (Log-space)
+        relax = 0.5
+        log_old = np.log10(np.maximum(self.ne_grid, 1e-20))
+        log_new = np.log10(np.maximum(ne_new, 1e-20))
+        self.ne_grid = 10**(log_old + relax * (log_new - log_old))
+        
+
     def apply_boundary_conditions(self):
         
         # Axis of symmetry (r=0): dTe/dr = 0
