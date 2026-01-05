@@ -231,6 +231,7 @@ class ElectronFluidContainer:
 
         self.apply_boundary_conditions()
 
+
     def compute_elastic_collisions_term(
         self,
         geom,
@@ -325,7 +326,66 @@ class ElectronFluidContainer:
         log_old = np.log10(np.maximum(self.ne_grid, 1e-20))
         log_new = np.log10(np.maximum(ne_new, 1e-20))
         self.ne_grid = 10**(log_old + relax * (log_new - log_old))
+
+
+    def update_Te_implicit(self, geom, hybrid_pic, neutral_fluid, ion_fluid, chemistry, dt):
+        """
+        Implicit update for Electron Temperature.
+        Allows large timesteps by splitting Local Physics and Global Transport.
+        """
         
+        # 1. Update Drift Velocities (needed for Advection if we add it back later)
+        self.update_drift_velocities(hybrid_pic)
+        
+        # 2. Update Conductivities (Kappa)
+        self.set_kappa(hybrid_pic)
+        
+        # 3. STAGE A: Local Physics (Heating + Collisions + Ionization Cost)
+        # ----------------------------------------------------------------
+        # Ionization Energy Cost (approx 13.6 eV + radiation ~ 30 eV per event)
+        E_cost_J = 30.0 * constants.q_e 
+        
+        electron_fluid_helper.update_Te_local_physics(
+            self.Te_grid,
+            self.ne_grid,
+            neutral_fluid.nn_grid,
+            neutral_fluid.T_n_grid,
+            ion_fluid.Ti_grid,
+            self.nu_en_grid,
+            self.nu_ei_grid,
+            chemistry.nu_iz_grid, # From Chemistry
+            self.Q_Joule_grid,    # Ensure this is pre-calculated!
+            E_cost_J,
+            dt,
+            geom.mask
+        )
+        
+        # 4. STAGE B: Global Transport (Implicit Diffusion)
+        # ----------------------------------------------------------------
+        # We assume geometry is 1D r-coords. If geom.r is 2D, extract row.
+        r_coords = geom.r[:, 0] if geom.r.ndim == 2 else geom.r
+        
+        electron_fluid_helper.solve_Te_diffusion_implicit_SOR(
+            self.Te_grid,
+            self.ne_grid,
+            self.kappa_parallel_grid,
+            self.kappa_perp_grid,
+            hybrid_pic.br_grid,
+            hybrid_pic.bz_grid,
+            geom.mask,
+            geom.dr,
+            geom.dz,
+            r_coords,
+            dt,
+            ion_fluid.m_i # Use ion mass for Bohm speed
+        )
+        
+        # 5. Boundary Conditions (Enforce Dirichlet if any)
+        self.Te_grid[geom.cathode_mask] = geom.temperature_cathode
+        self.Te_grid[geom.anode1_mask] = geom.temperature_anode
+        self.Te_grid[geom.anode2_mask] = geom.temperature_anode
+        self.apply_boundary_conditions()
+
 
     def apply_boundary_conditions(self):
         

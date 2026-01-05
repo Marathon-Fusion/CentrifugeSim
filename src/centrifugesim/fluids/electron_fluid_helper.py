@@ -653,3 +653,214 @@ def compute_ambipolar_loss_rate_anisotropic(Te, Ti, nu_in, beta_e, beta_i,
             nu_loss[i, j] = (Da_par * inv_Lambda_z_sq) + (Da_perp * inv_Lambda_r_sq)
             
     return nu_loss
+
+
+@njit(cache=True)
+def update_Te_local_physics(Te, ne, nn, T_n, T_i, 
+                            nu_en, nu_ei, nu_iz, 
+                            Q_Joule, epsilon_iz_J, dt, mask):
+    """
+    Updates Te based on Local Sources/Sinks (Heating + Collisions).
+    Uses Semi-Implicit formulation for unconditional stability.
+    """
+    Nr, Nz = Te.shape
+    kb = constants.kb
+    me = constants.m_e
+    mi = constants.m_p # Approximate as Proton for mass ratio
+    
+    # Energy Cost per ionization event (Ionization Potential + Radiation estimate)
+    # epsilon_iz_J is typically ~ 13.6 eV * q_e (plus losses)
+    
+    for i in range(Nr):
+        for j in range(Nz):
+            if mask[i, j] == 1:
+                
+                # 1. Coefficients
+                n_e_local = max(ne[i, j], 1e10)
+                T_old = Te[i, j]
+                
+                # Heat Capacity per unit volume (3/2 n k)
+                Cv = 1.5 * n_e_local * kb
+                
+                # 2. Source Terms (Explicit)
+                # Joule Heating is usually treated as constant over the step
+                S_heating = Q_Joule[i, j] 
+                
+                # Inelastic Cooling (Ionization Energy Loss)
+                # Loss = Rate * Energy_Cost
+                S_inelastic = -1.0 * n_e_local * nu_iz[i, j] * epsilon_iz_J
+                
+                # 3. Elastic Collisions (Semi-Implicit)
+                # We write: dT/dt = -nu_energy * (T - T_target)
+                # T_new = (T_old + dt*nu*T_target) / (1 + dt*nu)
+                
+                # Frequency of energy exchange (not just momentum exchange)
+                # nu_E ~ 2 * (me/M) * nu_momentum
+                freq_en = 2.0 * (me / 1.67e-27) * nu_en[i, j] # Assuming H atom mass
+                freq_ei = 2.0 * (me / mi) * nu_ei[i, j]
+                
+                # Total Energy Relaxation Rate
+                nu_relax = freq_en + freq_ei
+                
+                # Weighted Target Temperature
+                if nu_relax > 1e-20:
+                    T_target = (freq_en * T_n[i, j] + freq_ei * T_i[i, j]) / nu_relax
+                else:
+                    T_target = T_n[i, j]
+                
+                # 4. The Implicit Update Equation
+                # Cv * (T_new - T_old)/dt = S_heat + S_inel + Cv * nu_relax * (T_target - T_new)
+                # Rearranging for T_new:
+                
+                numerator = Cv * T_old + dt * (S_heating + S_inelastic + Cv * nu_relax * T_target)
+                denominator = Cv * (1.0 + dt * nu_relax)
+                
+                T_new = numerator / denominator
+                
+                # Safety Floor
+                if T_new < 0.025 * 11604: # Floor at 0.025 eV (Room Temp)
+                    T_new = 0.025 * 11604
+                    
+                Te[i, j] = T_new
+
+
+@njit(cache=True)
+def solve_Te_diffusion_implicit_SOR(Te, ne, kappa_par, kappa_perp, 
+                                    br, bz, mask, dr, dz, r_coords, dt, 
+                                    mi, max_iter=2000, tol=1e-4, omega=1.4):
+    """
+    Implicit Heat Diffusion Solver (SOR).
+    Replaces the explicit diffusion limit.
+    """
+    Nr, Nz = Te.shape
+    kb = constants.kb
+    
+    # Pre-calc geometry
+    inv_dr2 = 1.0 / (dr * dr)
+    inv_dz2 = 1.0 / (dz * dz)
+    
+    # Sheath Parameters for BCs
+    delta_sheath = 6.0 
+    
+    for k in range(max_iter):
+        max_diff = 0.0
+        
+        for i in range(0, Nr):
+            r_loc = r_coords[i]
+            inv_r = 1.0 / (r_loc + 1e-12)
+            
+            for j in range(0, Nz):
+                
+                # Skip Mask or Empty Plasma
+                if mask[i, j] == 0:
+                    continue
+                if ne[i, j] < 1e10:
+                    continue
+                
+                # --- 1. Identify Neighbors & Boundary Flags ---
+                # We define "flux" coefficients for the 4 neighbors
+                # (North, South, East, West)
+                
+                # Check neighbors to see if we are on a boundary
+                has_N = (j < Nz-1) and (mask[i, j+1] == 1)
+                has_S = (j > 0)    and (mask[i, j-1] == 1)
+                has_E = (i < Nr-1) and (mask[i+1, j] == 1)
+                has_W = (i > 0)    and (mask[i-1, j] == 1)
+                
+                # Local Conductivity Tensor Projection
+                # k_rr = k_perp + (k_par - k_perp) * br^2
+                # k_zz = k_perp + (k_par - k_perp) * bz^2
+                # We use a simplified 5-point stencil for the implicit matrix 
+                # (neglecting cross-terms k_rz for the LHS matrix to keep it diagonally dominant,
+                #  but you can add them to the RHS "source" if strictly needed. 
+                #  Usually k_rr and k_zz dominance is enough for stability).
+                
+                k_p = kappa_par[i, j]
+                k_v = kappa_perp[i, j]
+                Br = br[i, j]
+                Bz = bz[i, j]
+                
+                k_rr = k_v + (k_p - k_v) * Br*Br
+                k_zz = k_v + (k_p - k_v) * Bz*Bz
+                
+                # Heat Capacity Term (Inertia)
+                Cv_term = 1.5 * ne[i, j] * kb / dt
+                
+                # Stencil Coefficients (Harmonic mean approx)
+                # Flux = -k * dT/dx  -> Discretized: Coeff * (T_neighbor - T_center)
+                
+                a_E = k_rr * inv_dr2 # East (i+1)
+                a_W = k_rr * inv_dr2 # West (i-1)
+                a_N = k_zz * inv_dz2 # North (j+1)
+                a_S = k_zz * inv_dz2 # South (j-1)
+                
+                # Cylindrical Correction for Radial terms
+                # (1/r) d/dr (r dT/dr) -> d2T/dr2 + (1/r)dT/dr
+                # East: (1 + dr/2r) * a_E, West: (1 - dr/2r) * a_W
+                geom_fac = 0.5 * dr * inv_r
+                a_E *= (1.0 + geom_fac)
+                a_W *= (1.0 - geom_fac)
+                
+                # --- 2. Handle Boundary Conditions (Modify Coeffs & RHS) ---
+                RHS_source = 0.0
+                
+                # Z-MAX (Top): Insulating (Neumann = 0)
+                if not has_N: 
+                    a_N = 0.0 # No conduction from top
+                
+                # Z-MIN (Bottom): Bohm Sheath Sink
+                if not has_S:
+                    a_S = 0.0 
+                    # Add explicit sink term for Sheath: q = delta * n * cs * kTe
+                    # Linearize: Flux = Gamma * T_center
+                    cs = np.sqrt(kb * Te[i, j] / mi)
+                    G_sheath = delta_sheath * ne[i, j] * cs * kb
+                    # Boundary term acts as a cooling rate on T_center
+                    # We add G_sheath/dz to the center coefficient
+                    Cv_term += G_sheath / dz
+                
+                # R-MAX (Outer): Bohm Sheath Sink
+                if not has_E:
+                    a_E = 0.0
+                    cs = np.sqrt(kb * Te[i, j] / mi)
+                    G_sheath = delta_sheath * ne[i, j] * cs * kb
+                    Cv_term += G_sheath / dr
+                    
+                # R-MIN (Axis): Symmetry (Neumann = 0)
+                if not has_W:
+                    a_W = 0.0
+                    
+                # --- 3. SOR Update ---
+                # Equation: Cv_term * T_new - Sum(a_nb * T_nb) = Cv_term * T_old
+                # Rearrange: (Cv_term + Sum(a_nb)) * T_new = Cv_term * T_old + Sum(a_nb * T_nb)
+                
+                Sigma_a = a_E + a_W + a_N + a_S
+                
+                # Neighbors (Use latest available values)
+                # Handle boundaries where a=0 by multiplying by 0, 
+                # but need indices to be safe.
+                T_E = Te[i+1, j] if has_E else 0.0
+                T_W = Te[i-1, j] if has_W else 0.0
+                T_N = Te[i, j+1] if has_N else 0.0
+                T_S = Te[i, j-1] if has_S else 0.0
+                
+                Sum_Flux = a_E*T_E + a_W*T_W + a_N*T_N + a_S*T_S
+                
+                # Center Coefficient
+                Coeff_Center = Cv_term + Sigma_a
+                
+                # RHS = Inertia + Inflow
+                RHS = (1.5 * ne[i, j] * kb / dt) * Te[i, j] + Sum_Flux
+                
+                # Calculate Star value
+                T_star = RHS / Coeff_Center
+                
+                # SOR Relaxation
+                diff = abs(T_star - Te[i, j])
+                Te[i, j] = (1.0 - omega) * Te[i, j] + omega * T_star
+                
+                if diff > max_diff:
+                    max_diff = diff
+                    
+        if max_diff < tol:
+            break
