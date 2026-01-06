@@ -216,9 +216,7 @@ class HybridPICModel:
                             ne_floor=electron_fluid.ne_floor,
                             fill_solid_with_nan=False)
 
-        # TO DO q_ohm
-        #    move to kernel
-        #    separate between ions and electrons
+        # q_ohm = sigma_P*Er^2 + sigma_parallel*Ez^2
         q_ohm = self.sigma_P_grid*Er*Er + self.sigma_parallel_grid*Ez*Ez
 
         self.phi_grid = np.copy(phi)

@@ -28,6 +28,8 @@ class ElectronFluidContainer:
 
         self.ne_grid = np.zeros((geom.Nr,geom.Nz)).astype(np.float64) # [m^-3]
         self.Te_grid = np.zeros((geom.Nr,geom.Nz)).astype(np.float64) # [K] !
+
+        self.ne_grid_prev = np.zeros((geom.Nr,geom.Nz)).astype(np.float64) # [m^-3]
         self.Te_grid_prev = np.zeros((geom.Nr,geom.Nz)).astype(np.float64) # [K] !
 
         self.pe_grid = np.zeros((geom.Nr,geom.Nz)).astype(np.float64) # [Pa] !
@@ -155,7 +157,12 @@ class ElectronFluidContainer:
         self.beta_e_grid[:]         = _beta_e
 
     def update_Te(self, geom, hybrid_pic, neutral_fluid, particle_container, Ts_host, Q_Joule_grid, dt, p_RF=None):
-        "Update Te function solving energy equation"
+        """
+        Update Te function solving energy equation
+        Note: this is an explicit solver with substepping for stability used in first version of code
+        It requires a small timestep.
+        Next version will use semi-implicit solver instead to reduce computational cost.
+        """
         Te_new = np.zeros_like(self.Te_grid)
 
         # Effective thermal diffusivity for electrons from parallel conductivity
@@ -231,6 +238,7 @@ class ElectronFluidContainer:
 
         self.apply_boundary_conditions()
 
+
     def compute_elastic_collisions_term(
         self,
         geom,
@@ -273,6 +281,123 @@ class ElectronFluidContainer:
             # Write back masked regions
             self.Te_grid[geom.mask==1] -= de/(3/2*constants.kb*ne[geom.mask==1])
             neutral_fluid.T_n_grid[geom.mask==1] += dt_sub*Q_coll_en[geom.mask==1]/(3/2*constants.kb*nn[geom.mask==1])
+
+
+    def update_density_implicit(self, geom, ion_fluid, nu_iz_grid, nu_RR_recomb_grid, beta_rec_grid, dt):
+        """
+        Updates ne using the Analytic Logistic Solution with Anisotropic Diffusion.
+        """
+        
+        # 1. Fetch Rates (Inputs from Chemistry)
+        nu_iz = nu_iz_grid      # [1/s]
+        nu_RR = nu_RR_recomb_grid  # [1/s] (Radiative Recomb)
+        beta_rec = beta_rec_grid # [m^3/s]
+        
+        # 2. Geometric Loss Factors (Pre-calculated Scalars)
+        # R_max and L_z define the fundamental diffusion mode
+        R_max = geom.r.max()
+        L_z = geom.z.max() - geom.z.min()
+        
+        # 1/L^2 factors
+        inv_Lambda_r_sq = (2.405 / R_max)**2
+        inv_Lambda_z_sq = (np.pi / (2.0 * L_z))**2
+        
+        # 3. Compute Effective Loss Rate (Anisotropic)
+        # This returns a GRID of loss frequencies [1/s]
+        nu_diff_grid = electron_fluid_helper.compute_ambipolar_loss_rate_anisotropic(
+            self.Te_grid,
+            ion_fluid.Ti_grid,
+            ion_fluid.nu_i_grid,    # Ion-Neutral Collisions (dominates drag)
+            self.beta_e_grid,       # Electron Magnetization
+            ion_fluid.beta_i_grid,  # Ion Magnetization
+            ion_fluid.m_i,          # Ion Mass
+            constants.kb,
+            inv_Lambda_z_sq,        # Axial geometric factor
+            inv_Lambda_r_sq         # Radial geometric factor
+        )
+        
+        # 4. Call the Anisotropic Analytic Kernel
+        ne_new = np.zeros_like(self.ne_grid)
+        
+        electron_fluid_helper.time_advance_ne_analytic_kernel_anisotropic(
+            ne_new,             # Output
+            self.ne_grid,       # Input (Old)
+            nu_iz,              # Ionization Source
+            nu_diff_grid,       # Calculated Anisotropic Loss
+            nu_RR,              # Radiative Recombination Loss
+            beta_rec,           # Recombination Sink
+            dt,                 # Timestep
+            geom.mask
+        )
+        
+        # 5. Apply Under-Relaxation (Log-space)
+        relax = 0.5
+        log_old = np.log10(np.maximum(self.ne_grid, 1e-20))
+        log_new = np.log10(np.maximum(ne_new, 1e-20))
+        self.ne_grid = 10**(log_old + relax * (log_new - log_old))
+
+
+    def update_Te_implicit(self, geom, hybrid_pic, neutral_fluid, ion_fluid, Q_Joule_e_grid, nu_iz_grid, delta_E_eV_ionization, dt, q_RF_grid=None):
+        """
+        Implicit update for Electron Temperature.
+        Allows large timesteps by splitting Local Physics and Global Transport.
+        """
+        
+        mi = ion_fluid.m_i
+        mn = neutral_fluid.mass
+        
+        # A: Local Physics (Heating + Collisions + Ionization Cost)
+        # ----------------------------------------------------------------
+        # Ionization Energy Cost
+        E_cost_J = delta_E_eV_ionization * constants.q_e 
+        
+        if q_RF_grid is not None:
+            Q_Joule_e_grid += q_RF_grid
+
+        electron_fluid_helper.update_Te_local_physics(
+            self.Te_grid,
+            self.ne_grid,
+            neutral_fluid.nn_grid,
+            neutral_fluid.T_n_grid,
+            ion_fluid.Ti_grid,
+            self.nu_en_grid,
+            self.nu_ei_grid,
+            nu_iz_grid,
+            Q_Joule_e_grid,
+            E_cost_J,
+            dt,
+            mi,
+            mn,
+            geom.mask,
+            self.Te_floor
+        )
+        
+        # B: Global Transport (Implicit Diffusion)
+        # ----------------------------------------------------------------
+        r_coords = geom.r
+        
+        """
+        electron_fluid_helper.solve_Te_diffusion_implicit_SOR(
+            self.Te_grid,
+            self.ne_grid,
+            self.kappa_parallel_grid,
+            self.kappa_perp_grid,
+            hybrid_pic.br_grid,
+            hybrid_pic.bz_grid,
+            geom.mask,
+            geom.dr,
+            geom.dz,
+            r_coords,
+            dt,
+            ion_fluid.m_i # Use ion mass for Bohm speed
+        )
+        """
+        
+        # 5. Boundary Conditions (Enforce Dirichlet if any)
+        self.Te_grid[geom.cathode_mask] = geom.temperature_cathode
+        self.Te_grid[geom.anode1_mask] = geom.temperature_anode
+        self.Te_grid[geom.anode2_mask] = geom.temperature_anode
+        self.apply_boundary_conditions()
 
 
     def apply_boundary_conditions(self):
