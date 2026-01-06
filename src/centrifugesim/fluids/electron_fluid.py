@@ -28,6 +28,8 @@ class ElectronFluidContainer:
 
         self.ne_grid = np.zeros((geom.Nr,geom.Nz)).astype(np.float64) # [m^-3]
         self.Te_grid = np.zeros((geom.Nr,geom.Nz)).astype(np.float64) # [K] !
+
+        self.ne_grid_prev = np.zeros((geom.Nr,geom.Nz)).astype(np.float64) # [m^-3]
         self.Te_grid_prev = np.zeros((geom.Nr,geom.Nz)).astype(np.float64) # [K] !
 
         self.pe_grid = np.zeros((geom.Nr,geom.Nz)).astype(np.float64) # [Pa] !
