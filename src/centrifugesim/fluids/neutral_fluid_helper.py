@@ -799,6 +799,9 @@ def update_u_in_collisions(
 ):
     """
     This assumes that dt*nu<0.1
+    and also performs explicit update of neutral temperature Tn
+    due to collisional energy exchange and viscous heating.
+    Returns updated (un_r, un_t, un_z, Tn)
     """
     NR, NZ = mask.shape
 

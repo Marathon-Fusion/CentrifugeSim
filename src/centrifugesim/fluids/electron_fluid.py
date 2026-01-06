@@ -337,23 +337,23 @@ class ElectronFluidContainer:
         self.ne_grid = 10**(log_old + relax * (log_new - log_old))
 
 
-    def update_Te_implicit(self, geom, hybrid_pic, neutral_fluid, ion_fluid, nu_iz_grid, dt):
+    def update_Te_implicit(self, geom, hybrid_pic, neutral_fluid, ion_fluid, Q_Joule_e_grid, nu_iz_grid, delta_E_eV_ionization, dt, q_RF_grid=None):
         """
         Implicit update for Electron Temperature.
         Allows large timesteps by splitting Local Physics and Global Transport.
         """
         
-        # 1. Update Drift Velocities (needed for Advection if we add it back later)
-        self.update_drift_velocities(hybrid_pic)
+        mi = ion_fluid.m_i
+        mn = neutral_fluid.mass
         
-        # 2. Update Conductivities (Kappa)
-        self.set_kappa(hybrid_pic)
-        
-        # 3. STAGE A: Local Physics (Heating + Collisions + Ionization Cost)
+        # A: Local Physics (Heating + Collisions + Ionization Cost)
         # ----------------------------------------------------------------
-        # Ionization Energy Cost (approx 13.6 eV + radiation ~ 30 eV per event)
-        E_cost_J = 30.0 * constants.q_e 
+        # Ionization Energy Cost
+        E_cost_J = delta_E_eV_ionization * constants.q_e 
         
+        if q_RF_grid is not None:
+            Q_Joule_e_grid += q_RF_grid
+
         electron_fluid_helper.update_Te_local_physics(
             self.Te_grid,
             self.ne_grid,
@@ -363,17 +363,20 @@ class ElectronFluidContainer:
             self.nu_en_grid,
             self.nu_ei_grid,
             nu_iz_grid,
-            self.Q_Joule_grid,    # Ensure this is pre-calculated!
+            Q_Joule_e_grid,
             E_cost_J,
             dt,
-            geom.mask
+            mi,
+            mn,
+            geom.mask,
+            self.Te_floor
         )
         
-        # 4. STAGE B: Global Transport (Implicit Diffusion)
+        # B: Global Transport (Implicit Diffusion)
         # ----------------------------------------------------------------
-        # We assume geometry is 1D r-coords. If geom.r is 2D, extract row.
-        r_coords = geom.r[:, 0] if geom.r.ndim == 2 else geom.r
+        r_coords = geom.r
         
+        """
         electron_fluid_helper.solve_Te_diffusion_implicit_SOR(
             self.Te_grid,
             self.ne_grid,
@@ -388,6 +391,7 @@ class ElectronFluidContainer:
             dt,
             ion_fluid.m_i # Use ion mass for Bohm speed
         )
+        """
         
         # 5. Boundary Conditions (Enforce Dirichlet if any)
         self.Te_grid[geom.cathode_mask] = geom.temperature_cathode

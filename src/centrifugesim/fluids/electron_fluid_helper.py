@@ -659,7 +659,7 @@ def compute_ambipolar_loss_rate_anisotropic(Te, Ti, nu_in, beta_e, beta_i,
 @njit(cache=True)
 def update_Te_local_physics(Te, ne, nn, T_n, T_i, 
                             nu_en, nu_ei, nu_iz, 
-                            Q_Joule, epsilon_iz_J, dt, mask):
+                            Q_Joule, epsilon_iz_J, dt, mi, mn, mask, Te_floor):
     """
     Updates Te based on Local Sources/Sinks (Heating + Collisions).
     Uses Semi-Implicit formulation for unconditional stability.
@@ -667,7 +667,6 @@ def update_Te_local_physics(Te, ne, nn, T_n, T_i,
     Nr, Nz = Te.shape
     kb = constants.kb
     me = constants.m_e
-    mi = constants.m_p # Approximate as Proton for mass ratio
     
     # Energy Cost per ionization event (Ionization Potential + Radiation estimate)
     # epsilon_iz_J is typically ~ 13.6 eV * q_e (plus losses)
@@ -697,7 +696,7 @@ def update_Te_local_physics(Te, ne, nn, T_n, T_i,
                 
                 # Frequency of energy exchange (not just momentum exchange)
                 # nu_E ~ 2 * (me/M) * nu_momentum
-                freq_en = 2.0 * (me / 1.67e-27) * nu_en[i, j] # Assuming H atom mass
+                freq_en = 2.0 * (me / mn) * nu_en[i, j] # Assuming H atom mass
                 freq_ei = 2.0 * (me / mi) * nu_ei[i, j]
                 
                 # Total Energy Relaxation Rate
@@ -719,8 +718,8 @@ def update_Te_local_physics(Te, ne, nn, T_n, T_i,
                 T_new = numerator / denominator
                 
                 # Safety Floor
-                if T_new < 0.025 * 11604: # Floor at 0.025 eV (Room Temp)
-                    T_new = 0.025 * 11604
+                if T_new < Te_floor:
+                    T_new = Te_floor
                     
                 Te[i, j] = T_new
 
