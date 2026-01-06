@@ -233,7 +233,7 @@ class HybridPICModel:
 
         del phi, Er, Ez, Jr, Jz, q_ohm
 
-    def update_Ji_Ji_and_compute_DC_power_e_and_i(self, geom, electron_fluid, ion_fluid):
+    def update_Je_Ji_and_compute_DC_power_e_and_i(self, geom, electron_fluid, ion_fluid):
         self.update_Je_and_Ji_from_Jtotal(geom, electron_fluid, ion_fluid)
         self.q_ohm_ions_grid = ion_fluid.sigma_P_grid*self.Er_grid*self.Er_grid + ion_fluid.sigma_parallel_grid*self.Ez_grid*self.Ez_grid
         self.q_ohm_electrons_grid = electron_fluid.sigma_P_grid*self.Er_grid*self.Er_grid + electron_fluid.sigma_parallel_grid*self.Ez_grid*self.Ez_grid
