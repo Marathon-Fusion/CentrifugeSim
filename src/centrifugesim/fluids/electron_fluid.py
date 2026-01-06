@@ -376,7 +376,6 @@ class ElectronFluidContainer:
         # ----------------------------------------------------------------
         r_coords = geom.r
         
-        """
         electron_fluid_helper.solve_Te_diffusion_implicit_SOR(
             self.Te_grid,
             self.ne_grid,
@@ -389,9 +388,9 @@ class ElectronFluidContainer:
             geom.dz,
             r_coords,
             dt,
-            ion_fluid.m_i # Use ion mass for Bohm speed
+            ion_fluid.m_i, # Use ion mass for Bohm speed
+            self.Te_floor
         )
-        """
         
         # 5. Boundary Conditions (Enforce Dirichlet if any)
         self.Te_grid[geom.cathode_mask] = geom.temperature_cathode

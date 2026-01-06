@@ -727,10 +727,12 @@ def update_Te_local_physics(Te, ne, nn, T_n, T_i,
 @njit(cache=True)
 def solve_Te_diffusion_implicit_SOR(Te, ne, kappa_par, kappa_perp, 
                                     br, bz, mask, dr, dz, r_coords, dt, 
-                                    mi, max_iter=2000, tol=1e-4, omega=1.4):
+                                    mi, Te_floor, max_iter=2000, tol=1e-4, omega=0.9):
     """
     Implicit Heat Diffusion Solver (SOR).
-    Replaces the explicit diffusion limit.
+    Updates:
+    - Bohm Sheath cooling applied ONLY at Physical Walls (j=0 and i=Nr-1).
+    - Internal Mask boundaries are Insulating (Neumann=0).
     """
     Nr, Nz = Te.shape
     kb = constants.kb
@@ -740,7 +742,7 @@ def solve_Te_diffusion_implicit_SOR(Te, ne, kappa_par, kappa_perp,
     inv_dz2 = 1.0 / (dz * dz)
     
     # Sheath Parameters for BCs
-    delta_sheath = 6.0 
+    delta_sheath = 1.0 
     
     for k in range(max_iter):
         max_diff = 0.0
@@ -758,23 +760,13 @@ def solve_Te_diffusion_implicit_SOR(Te, ne, kappa_par, kappa_perp,
                     continue
                 
                 # --- 1. Identify Neighbors & Boundary Flags ---
-                # We define "flux" coefficients for the 4 neighbors
-                # (North, South, East, West)
-                
-                # Check neighbors to see if we are on a boundary
+                # Check neighbors to see if we are connected to valid plasma
                 has_N = (j < Nz-1) and (mask[i, j+1] == 1)
                 has_S = (j > 0)    and (mask[i, j-1] == 1)
                 has_E = (i < Nr-1) and (mask[i+1, j] == 1)
                 has_W = (i > 0)    and (mask[i-1, j] == 1)
                 
-                # Local Conductivity Tensor Projection
-                # k_rr = k_perp + (k_par - k_perp) * br^2
-                # k_zz = k_perp + (k_par - k_perp) * bz^2
-                # We use a simplified 5-point stencil for the implicit matrix 
-                # (neglecting cross-terms k_rz for the LHS matrix to keep it diagonally dominant,
-                #  but you can add them to the RHS "source" if strictly needed. 
-                #  Usually k_rr and k_zz dominance is enough for stability).
-                
+                # --- 2. Calculate Stencil Coefficients (Standard Diffusion) ---
                 k_p = kappa_par[i, j]
                 k_v = kappa_perp[i, j]
                 Br = br[i, j]
@@ -786,59 +778,51 @@ def solve_Te_diffusion_implicit_SOR(Te, ne, kappa_par, kappa_perp,
                 # Heat Capacity Term (Inertia)
                 Cv_term = 1.5 * ne[i, j] * kb / dt
                 
-                # Stencil Coefficients (Harmonic mean approx)
-                # Flux = -k * dT/dx  -> Discretized: Coeff * (T_neighbor - T_center)
+                # Base Coefficients
+                a_E = k_rr * inv_dr2 
+                a_W = k_rr * inv_dr2 
+                a_N = k_zz * inv_dz2 
+                a_S = k_zz * inv_dz2 
                 
-                a_E = k_rr * inv_dr2 # East (i+1)
-                a_W = k_rr * inv_dr2 # West (i-1)
-                a_N = k_zz * inv_dz2 # North (j+1)
-                a_S = k_zz * inv_dz2 # South (j-1)
-                
-                # Cylindrical Correction for Radial terms
-                # (1/r) d/dr (r dT/dr) -> d2T/dr2 + (1/r)dT/dr
-                # East: (1 + dr/2r) * a_E, West: (1 - dr/2r) * a_W
+                # Cylindrical Correction
                 geom_fac = 0.5 * dr * inv_r
                 a_E *= (1.0 + geom_fac)
                 a_W *= (1.0 - geom_fac)
                 
-                # --- 2. Handle Boundary Conditions (Modify Coeffs & RHS) ---
-                RHS_source = 0.0
+                # --- 3. Handle Boundaries ---
+                # We strictly distinguish between PHYSICAL LIMITS and INTERNAL MASKS
                 
-                # Z-MAX (Top): Insulating (Neumann = 0)
+                # NORTH (j+1)
                 if not has_N: 
-                    a_N = 0.0 # No conduction from top
+                    a_N = 0.0 # Insulating (Z_max or Internal Mask)
                 
-                # Z-MIN (Bottom): Bohm Sheath Sink
+                # SOUTH (j-1)
                 if not has_S:
                     a_S = 0.0 
-                    # Add explicit sink term for Sheath: q = delta * n * cs * kTe
-                    # Linearize: Flux = Gamma * T_center
-                    cs = np.sqrt(kb * Te[i, j] / mi)
-                    G_sheath = delta_sheath * ne[i, j] * cs * kb
-                    # Boundary term acts as a cooling rate on T_center
-                    # We add G_sheath/dz to the center coefficient
-                    Cv_term += G_sheath / dz
+                    # Only apply Bohm Sheath if we are at the PHYSICAL DOMAIN LIMIT (Z_min)
+                    if j == 0:
+                        cs = np.sqrt(kb * Te[i, j] / mi)
+                        G_sheath = delta_sheath * ne[i, j] * cs * kb
+                        Cv_term += G_sheath / dz
+                    # Else: Internal mask -> Insulating (do nothing)
                 
-                # R-MAX (Outer): Bohm Sheath Sink
+                # EAST (i+1)
                 if not has_E:
                     a_E = 0.0
-                    cs = np.sqrt(kb * Te[i, j] / mi)
-                    G_sheath = delta_sheath * ne[i, j] * cs * kb
-                    Cv_term += G_sheath / dr
+                    # Only apply Bohm Sheath if we are at the PHYSICAL DOMAIN LIMIT (R_max)
+                    if i == Nr - 1:
+                        cs = np.sqrt(kb * Te[i, j] / mi)
+                        G_sheath = delta_sheath * ne[i, j] * cs * kb
+                        Cv_term += G_sheath / dr
+                    # Else: Internal mask -> Insulating
                     
-                # R-MIN (Axis): Symmetry (Neumann = 0)
+                # WEST (i-1)
                 if not has_W:
-                    a_W = 0.0
+                    a_W = 0.0 # Insulating (Axis or Internal Mask)
                     
-                # --- 3. SOR Update ---
-                # Equation: Cv_term * T_new - Sum(a_nb * T_nb) = Cv_term * T_old
-                # Rearrange: (Cv_term + Sum(a_nb)) * T_new = Cv_term * T_old + Sum(a_nb * T_nb)
-                
+                # --- 4. SOR Update (Standard) ---
                 Sigma_a = a_E + a_W + a_N + a_S
                 
-                # Neighbors (Use latest available values)
-                # Handle boundaries where a=0 by multiplying by 0, 
-                # but need indices to be safe.
                 T_E = Te[i+1, j] if has_E else 0.0
                 T_W = Te[i-1, j] if has_W else 0.0
                 T_N = Te[i, j+1] if has_N else 0.0
@@ -846,18 +830,15 @@ def solve_Te_diffusion_implicit_SOR(Te, ne, kappa_par, kappa_perp,
                 
                 Sum_Flux = a_E*T_E + a_W*T_W + a_N*T_N + a_S*T_S
                 
-                # Center Coefficient
                 Coeff_Center = Cv_term + Sigma_a
-                
-                # RHS = Inertia + Inflow
                 RHS = (1.5 * ne[i, j] * kb / dt) * Te[i, j] + Sum_Flux
                 
-                # Calculate Star value
                 T_star = RHS / Coeff_Center
                 
-                # SOR Relaxation
                 diff = abs(T_star - Te[i, j])
                 Te[i, j] = (1.0 - omega) * Te[i, j] + omega * T_star
+
+                Te[i, j] = max(Te[i, j], Te_floor)
                 
                 if diff > max_diff:
                     max_diff = diff
