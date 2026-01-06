@@ -187,7 +187,7 @@ def stable_dt(fluid, r, dr, dz,
             dt_cond = 0.25 * min(dr*dr, dz*dz) / alpha_max
 
     dt = safety * min(dt_adv, dt_visc, dt_cond)
-    return dt if np.isfinite(dt) else 1e-6
+    return dt, dt_adv, dt_visc, dt_cond
 
 # ---------- Rusanov (LLF) flux for scalar advection in RZ ----------
 @njit(parallel=True, fastmath=True, cache=True)
@@ -823,6 +823,51 @@ def update_u_in_collisions(
                 Tn_new[i, j] = Tn[i, j] + factor/c_v*du2 + factor*(Ti[i, j] - Tn[i, j])
 
     return un_r_new, un_t_new, un_z_new, Tn_new
+
+@njit(cache=True)
+def update_neutral_vtheta_implicit_source(un_theta, vi_theta, 
+                                          ni, nu_in, mi, 
+                                          nn, mn, 
+                                          dt, mask):
+    """
+    Updates Neutral v_theta using an Implicit Source term for Drag.
+    Allows large timesteps (dt) without instability from stiff collisions.
+    
+    Formula:
+      u_new = ( u_old + dt * alpha * v_i ) / ( 1 + dt * alpha )
+      where alpha = (ni * mi * nu_in) / (nn * mn)
+    """
+    Nr, Nz = un_theta.shape
+    
+    for i in range(Nr):
+        for j in range(Nz):
+            if mask[i, j] == 1:
+                # 1Local Densities
+                rho_n = nn[i, j] * mn
+                rho_i = ni[i, j] * mi
+                
+                # Collision Rate (Coupling Strength)
+                # alpha has units [1/s]
+                if rho_n > 1e-20:
+                    nu_coupling = (rho_i * nu_in[i, j]) / rho_n
+                else:
+                    nu_coupling = 0.0
+                
+                
+                # Implicit Update
+                # The denominator handles the stiffness
+                denom = 1.0 + dt * nu_coupling
+                
+                u_old = un_theta[i, j]
+                v_ion = vi_theta[i, j]
+                
+                # Numerator: Old Velocity + 'Target' velocity weighted by coupling
+                numerator = u_old + dt * (nu_coupling * v_ion )
+                
+                un_theta[i, j] = numerator / denom
+                
+            else:
+                un_theta[i, j] = 0.0
 
 
 @njit(parallel=True)
