@@ -138,6 +138,11 @@ class NeutralFluidContainer:
     def update_u_in_collisions(self, geom, ni_grid, mi,
                                     ui_r, ui_t, ui_z,
                                     nu_in, Ti, dt):
+        """
+        Updates Neutral velocity due to collisions with Ions. Explicit equation and it also updates gas temperature
+        Used when kinetic ions where on (as fluid counterpart of the MCC module used on kinetic ions).
+        Do not use this when fluid ions are on.
+        """
 
         dtnu_max = nu_in[geom.mask==1].max()*dt
         if(round(dtnu_max,2)>0.1):
@@ -154,6 +159,24 @@ class NeutralFluidContainer:
         self.un_theta_grid[geom.mask==1]    = np.copy(un_t_new[geom.mask==1])
         self.un_z_grid[geom.mask==1]        = np.copy(un_z_new[geom.mask==1])
         self.T_n_grid[geom.mask==1]         = np.copy(Tn_new[geom.mask==1])
+
+    def update_u_in_collisions_implicit(self, geom, ion_fluid, dt):
+        """
+        Updates Neutral velocity due to collisions with Ions using an implicit formula.
+        Used when fluid ions are on.
+        Do not use this when kinetic ions are on.
+        """
+        neutral_fluid_helper.update_neutral_vtheta_implicit_source(
+            self.un_theta_grid,
+            ion_fluid.vi_theta_grid,
+            ion_fluid.ni_grid,
+            ion_fluid.nu_i_grid,
+            ion_fluid.m_i,
+            self.nn_grid,
+            self.mass,
+            dt,
+            geom.mask
+        )
 
     def advance_with_T_ssp_rk2(self,
                             geom, dt,

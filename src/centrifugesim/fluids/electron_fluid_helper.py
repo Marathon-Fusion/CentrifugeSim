@@ -655,73 +655,126 @@ def compute_ambipolar_loss_rate_anisotropic(Te, Ti, nu_in, beta_e, beta_i,
             
     return nu_loss
 
+@njit(cache=True)
+def compute_steady_state_ne_kernel(ne_out, nu_iz, nu_loss, nu_RR, beta_rec, mask, ne_floor=1e10):
+    """
+    Computes the local equilibrium density ne where Production == Loss.
+    Solves: (nu_iz - nu_loss - nu_RR) * n - beta_rec * n^2 = 0
+    
+    If production < linear loss, returns ne_floor.
+    If production > linear loss, returns n = (Prod - LinearLoss) / Beta.
+    """
+    Nr, Nz = ne_out.shape
+       
+    for i in range(Nr):
+        for j in range(Nz):
+            if mask[i, j] == 1:
+                # 1. Calculate Net Linear Rate (alpha)
+                # alpha > 0 means the plasma wants to grow exponentially
+                # alpha < 0 means the plasma wants to die exponentially
+                alpha = nu_iz[i, j] - nu_loss[i, j] - nu_RR[i, j]
+                
+                beta = beta_rec[i, j]
+                
+                if alpha <= 0:
+                    # Physics: Ionization is too weak to sustain plasma against diffusion/RR.
+                    # Result: Plasma decays to floor.
+                    ne_out[i, j] = ne_floor
+                else:
+                    # Equilibrium: alpha * n = beta * n^2  ->  n = alpha / beta
+                    n_eq = alpha / beta
+                    ne_out[i, j] = max(n_eq, ne_floor)
+
+            else:
+                # Solid / Masked
+                ne_out[i, j] = ne_floor
 
 @njit(cache=True)
 def update_Te_local_physics(Te, ne, nn, T_n, T_i, 
-                            nu_en, nu_ei, nu_iz, 
-                            Q_Joule, epsilon_iz_J, dt, mi, mn, mask, Te_floor):
+                            nu_en, nu_ei, 
+                            Q_Joule, epsilon_iz_J, dt, mi, mn, mask, Te_floor,
+                            chem_T_arr, chem_k_arr):
     """
-    Updates Te based on Local Sources/Sinks (Heating + Collisions).
-    Uses Semi-Implicit formulation for unconditional stability.
+    Updates Te using Fully Implicit local physics.
+    Uses Internal Interpolation to evaluate Ionization Rate(T) inside the loop,
+    preventing time-lag instabilities.
     """
     Nr, Nz = Te.shape
     kb = constants.kb
     me = constants.m_e
-    
-    # Energy Cost per ionization event (Ionization Potential + Radiation estimate)
-    # epsilon_iz_J is typically ~ 13.6 eV * q_e (plus losses)
-    
+
     for i in range(Nr):
         for j in range(Nz):
             if mask[i, j] == 1:
                 
-                # 1. Coefficients
-                n_e_local = max(ne[i, j], 1e10)
+                n_e = max(ne[i, j], 1e10)
+                n_n = max(nn[i, j], 1e10)
                 T_old = Te[i, j]
+                Cv = 1.5 * n_e * kb
                 
-                # Heat Capacity per unit volume (3/2 n k)
-                Cv = 1.5 * n_e_local * kb
+                # 1. Source Terms
+                S_heating = Q_Joule[i, j]
                 
-                # 2. Source Terms (Explicit)
-                # Joule Heating is usually treated as constant over the step
-                S_heating = Q_Joule[i, j] 
-                
-                # Inelastic Cooling (Ionization Energy Loss)
-                # Loss = Rate * Energy_Cost
-                S_inelastic = -1.0 * n_e_local * nu_iz[i, j] * epsilon_iz_J
-                
-                # 3. Elastic Collisions (Semi-Implicit)
-                # We write: dT/dt = -nu_energy * (T - T_target)
-                # T_new = (T_old + dt*nu*T_target) / (1 + dt*nu)
-                
-                # Frequency of energy exchange (not just momentum exchange)
-                # nu_E ~ 2 * (me/M) * nu_momentum
-                freq_en = 2.0 * (me / mn) * nu_en[i, j] # Assuming H atom mass
+                # 2. Relaxation Params
+                freq_en = 2.0 * (me / mn) * nu_en[i, j] 
                 freq_ei = 2.0 * (me / mi) * nu_ei[i, j]
-                
-                # Total Energy Relaxation Rate
                 nu_relax = freq_en + freq_ei
                 
-                # Weighted Target Temperature
                 if nu_relax > 1e-20:
                     T_target = (freq_en * T_n[i, j] + freq_ei * T_i[i, j]) / nu_relax
                 else:
                     T_target = T_n[i, j]
+
+                # 3. NEWTON-RAPHSON SOLVER
+                T_guess = T_old
                 
-                # 4. The Implicit Update Equation
-                # Cv * (T_new - T_old)/dt = S_heat + S_inel + Cv * nu_relax * (T_target - T_new)
-                # Rearranging for T_new:
-                
-                numerator = Cv * T_old + dt * (S_heating + S_inelastic + Cv * nu_relax * T_target)
-                denominator = Cv * (1.0 + dt * nu_relax)
-                
-                T_new = numerator / denominator
-                
-                # Safety Floor
-                if T_new < Te_floor:
-                    T_new = Te_floor
+                for k in range(10): 
+                    T_safe = max(T_guess, 300.0)
                     
-                Te[i, j] = T_new
+                    # --- A. Internal Interpolation (The Fix) ---
+                    # We evaluate the rate at the CURRENT guess T_safe.
+                    # This replaces calling 'k_interp(T_safe)' which Numba cannot do.
+                    
+                    k_rate = np.interp(T_safe, chem_T_arr, chem_k_arr)
+                    
+                    # --- B. Numerical Derivative for Jacobian ---
+                    # Perturb T slightly to find the "Stiffness" (slope)
+                    delta_T = 0.01 * T_safe
+                    k_rate_plus = np.interp(T_safe + delta_T, chem_T_arr, chem_k_arr)
+                    dk_dT = (k_rate_plus - k_rate) / delta_T
+                    
+                    # --- C. Calculate Cooling ---
+                    # Cooling = n_e * nu_iz * Cost
+                    # nu_iz = n_n * k_rate
+                    S_cooling = n_e * (n_n * k_rate) * epsilon_iz_J
+                    
+                    # Derivative dS/dT 
+                    dS_cool_dT = n_e * n_n * dk_dT * epsilon_iz_J
+                    
+                    # --- D. Residual & Jacobian ---
+                    # F = Inertia + Relax + Cooling - Heating
+                    term_inertia = (Cv / dt) * (T_guess - T_old)
+                    term_relax   = Cv * nu_relax * (T_guess - T_target)
+                    
+                    F_val = term_inertia + term_relax + S_cooling - S_heating
+                    J_val = (Cv / dt) + (Cv * nu_relax) + dS_cool_dT
+                    
+                    # --- E. Newton Step ---
+                    if abs(J_val) < 1e-20: J_val = 1e-20
+                    delta = F_val / J_val
+                    
+                    # Damping
+                    max_step = 0.5 * T_guess
+                    if delta > max_step: delta = max_step
+                    if delta < -max_step: delta = -max_step
+                    
+                    T_guess = T_guess - delta
+                    
+                    if abs(delta) < 1e-3 * T_guess:
+                        break
+                
+                if T_guess < Te_floor: T_guess = Te_floor
+                Te[i, j] = T_guess
 
 
 @njit(cache=True)
@@ -755,8 +808,6 @@ def solve_Te_diffusion_implicit_SOR(Te, ne, kappa_par, kappa_perp,
                 
                 # Skip Mask or Empty Plasma
                 if mask[i, j] == 0:
-                    continue
-                if ne[i, j] < 1e10:
                     continue
                 
                 # --- 1. Identify Neighbors & Boundary Flags ---
