@@ -286,37 +286,35 @@ class ElectronFluidContainer:
     def update_density_implicit(self, geom, ion_fluid, nu_iz_grid, nu_RR_recomb_grid, beta_rec_grid, dt):
         """
         Updates ne using the Analytic Logistic Solution with Anisotropic Diffusion.
+        Includes Log-Space Clamping to prevent ionization-heating instabilities.
         """
         
-        # 1. Fetch Rates (Inputs from Chemistry)
+        # Fetch Rates (Inputs from Chemistry)
         nu_iz = nu_iz_grid      # [1/s]
         nu_RR = nu_RR_recomb_grid  # [1/s] (Radiative Recomb)
         beta_rec = beta_rec_grid # [m^3/s]
         
-        # 2. Geometric Loss Factors (Pre-calculated Scalars)
-        # R_max and L_z define the fundamental diffusion mode
+        # Geometric Loss Factors
         R_max = geom.r.max()
         L_z = geom.z.max() - geom.z.min()
         
-        # 1/L^2 factors
         inv_Lambda_r_sq = (2.405 / R_max)**2
         inv_Lambda_z_sq = (np.pi / (2.0 * L_z))**2
         
-        # 3. Compute Effective Loss Rate (Anisotropic)
-        # This returns a GRID of loss frequencies [1/s]
+        # Compute Effective Loss Rate (Anisotropic)
         nu_diff_grid = electron_fluid_helper.compute_ambipolar_loss_rate_anisotropic(
             self.Te_grid,
             ion_fluid.Ti_grid,
-            ion_fluid.nu_i_grid,    # Ion-Neutral Collisions (dominates drag)
-            self.beta_e_grid,       # Electron Magnetization
-            ion_fluid.beta_i_grid,  # Ion Magnetization
-            ion_fluid.m_i,          # Ion Mass
+            ion_fluid.nu_i_grid,
+            self.beta_e_grid,
+            ion_fluid.beta_i_grid,
+            ion_fluid.m_i,
             constants.kb,
-            inv_Lambda_z_sq,        # Axial geometric factor
-            inv_Lambda_r_sq         # Radial geometric factor
+            inv_Lambda_z_sq,
+            inv_Lambda_r_sq
         )
         
-        # 4. Call the Anisotropic Analytic Kernel
+        # Call the Anisotropic Analytic Kernel
         ne_new = np.zeros_like(self.ne_grid)
         
         electron_fluid_helper.time_advance_ne_analytic_kernel_anisotropic(
@@ -330,14 +328,80 @@ class ElectronFluidContainer:
             geom.mask
         )
         
-        # 5. Apply Under-Relaxation (Log-space)
-        relax = 0.5
-        log_old = np.log10(np.maximum(self.ne_grid, 1e-20))
-        log_new = np.log10(np.maximum(ne_new, 1e-20))
-        self.ne_grid = 10**(log_old + relax * (log_new - log_old))
+        # =========================================================
+        # Stability Fix: Log-Space Clamping & Under-Relaxation
+        # =========================================================
+        
+        # Safety floor for logs
+        ne_floor_log = 1e10
+        
+        # Compute Logarithms
+        log_old = np.log10(np.maximum(self.ne_grid, ne_floor_log))
+        log_target = np.log10(np.maximum(ne_new, ne_floor_log))
+        
+        # Calculate desired change
+        diff = log_target - log_old
+        
+        # CLAMP the change (The Fix!)
+        # MAX_LOG_STEP = 0.5 means max change is 10^0.5 ~= 3.16x per timestep.
+        # This prevents the 10^8 jumps.
+        MAX_LOG_STEP = 0.5 
+        diff_clipped = np.clip(diff, -MAX_LOG_STEP, MAX_LOG_STEP)
+        
+        # Apply Under-Relaxation to the *clipped* change
+        # RELAX = 0.2 means we take 20% of that clipped step.
+        # Increase this towards 1.0 once the simulation is stable.
+        RELAX = 0.2 
+        
+        log_final = log_old + RELAX * diff_clipped
+        
+        # Finalize
+        self.ne_grid = 10**(log_final)
 
+    def update_density_steady_state(self, geom, ion_fluid, nu_iz_grid, nu_RR_recomb_grid, beta_rec_grid):
+        """
+        Forces ne to the local steady-state equilibrium based on current Te and rates.
+        Solves: Production = Loss (Algebraic).
+        Useful for initializing the plasma or debugging transport limits.
+        """
+        
+        # 1. Geometric Factors for Ambipolar Diffusion
+        R_max = geom.r.max()
+        L_z = geom.z.max() - geom.z.min()
+        
+        inv_Lambda_r_sq = (2.405 / R_max)**2
+        inv_Lambda_z_sq = (np.pi / (2.0 * L_z))**2
+        
+        # 2. Compute Effective Diffusive Loss Rate [1/s]
+        nu_diff_grid = electron_fluid_helper.compute_ambipolar_loss_rate_anisotropic(
+            self.Te_grid,
+            ion_fluid.Ti_grid,
+            ion_fluid.nu_i_grid,
+            self.beta_e_grid,
+            ion_fluid.beta_i_grid,
+            ion_fluid.m_i,
+            constants.kb,
+            inv_Lambda_z_sq,
+            inv_Lambda_r_sq
+        )
+        
+        # 3. Call the Steady-State Kernel
+        # We write directly to self.ne_grid
+        electron_fluid_helper.compute_steady_state_ne_kernel(
+            self.ne_grid,        # Output
+            nu_iz_grid,          # Source [1/s]
+            nu_diff_grid,        # Diffusive Loss [1/s]
+            nu_RR_recomb_grid,   # Linear Recomb Loss [1/s]
+            beta_rec_grid,       # Quadratic Recomb Coeff [m^3/s]
+            geom.mask,
+            self.ne_floor
+        )
 
-    def update_Te_implicit(self, geom, hybrid_pic, neutral_fluid, ion_fluid, Q_Joule_e_grid, nu_iz_grid, delta_E_eV_ionization, dt, q_RF_grid=None):
+    def update_Te_implicit(self, geom, hybrid_pic, neutral_fluid, ion_fluid, 
+                           Q_Joule_e_grid, 
+                           delta_E_eV_ionization, dt, 
+                           chem_T_array, chem_k_array,
+                           q_RF_grid=None):
         """
         Implicit update for Electron Temperature.
         Allows large timesteps by splitting Local Physics and Global Transport.
@@ -362,14 +426,16 @@ class ElectronFluidContainer:
             ion_fluid.Ti_grid,
             self.nu_en_grid,
             self.nu_ei_grid,
-            nu_iz_grid,
             Q_Joule_e_grid,
             E_cost_J,
             dt,
             mi,
             mn,
             geom.mask,
-            self.Te_floor
+            self.Te_floor,
+            # Pass arrays to helper
+            chem_T_array,
+            chem_k_array
         )
         
         # B: Global Transport (Implicit Diffusion)
