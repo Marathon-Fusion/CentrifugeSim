@@ -325,7 +325,8 @@ class ElectronFluidContainer:
             nu_RR,              # Radiative Recombination Loss
             beta_rec,           # Recombination Sink
             dt,                 # Timestep
-            geom.mask
+            geom.mask,
+            self.ne_floor
         )
         
         # =========================================================
