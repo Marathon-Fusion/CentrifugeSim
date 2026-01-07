@@ -824,6 +824,39 @@ def update_u_in_collisions(
 
     return un_r_new, un_t_new, un_z_new, Tn_new
 
+@njit(parallel=True)
+def compute_knudsen_field(mask, T, p, sigma, L_char, kb, out):
+    """
+    Computes local Knudsen number Kn = lambda / L_char
+    Mean free path lambda = k_B * T / (sqrt(2) * pi * sigma^2 * p)
+    """
+    Nr, Nz = T.shape
+    # Precompute constant factor: k_B / (sqrt(2) * pi * sigma^2)
+
+    prefactor = kb / (1.41421356 * 3.14159265 * sigma**2)
+    inv_L = 1.0 / L_char
+
+    for i in prange(Nr):
+        for k in range(Nz):
+            if(mask[i, k] == 0):
+                out[i, k] = 0.0
+                continue
+            # p can be very close to zero in centrifuge core (vacuum).
+            # If p -> 0, lambda -> infinity, Kn -> infinity.
+            # We clamp to a large number or 0 depending on preference. 
+            # Here we just compute valid values and set 0.0 for pure vacuum.
+            if p[i, k] > 1e-20:
+                lam = prefactor * T[i, k] / p[i, k]
+                out[i, k] = lam * inv_L
+            else:
+                out[i, k] = 0.0 # Vacuum
+
+
+#############################################################################################
+######################### THE KERNELS BELOW ARE TO TEST IMPLICIT UPDATES ####################
+######################### FULL NAVIER STOKES IMPLICIT WILL BE IMPLEMENTED LATER #############
+#############################################################################################
+
 @njit(cache=True)
 def update_neutral_vtheta_implicit_source(un_theta, vi_theta, 
                                           ni, nu_in, mi, 
@@ -869,30 +902,228 @@ def update_neutral_vtheta_implicit_source(un_theta, vi_theta,
             else:
                 un_theta[i, j] = 0.0
 
-
-@njit(parallel=True)
-def compute_knudsen_field(mask, T, p, sigma, L_char, kb, out):
+@njit(cache=True)
+def update_neutral_temperature_implicit(Tn, Te, Ti, ne, nn, 
+                                        nu_en, nu_in, 
+                                        me, mi, mn, dt, mask):
     """
-    Computes local Knudsen number Kn = lambda / L_char
-    Mean free path lambda = k_B * T / (sqrt(2) * pi * sigma^2 * p)
+    Updates Neutral Temperature (Tn) using a Semi-Implicit collisional operator.
+    Ensures Tn approaches the plasma temperature stably without overshoot.
+    
+    Energy Equation:
+      Cv * dTn/dt = Q_en + Q_in
+      Q_en = 3 * (me/mn) * ne * nu_en * k * (Te - Tn)
+      Q_in = 3 * (mi/mn) * ni * nu_in * k * (Ti - Tn)
+      
+    Implicit Update:
+      Tn_new = (Tn_old + dt * Rate * T_target) / (1 + dt * Rate)
     """
-    Nr, Nz = T.shape
-    # Precompute constant factor: k_B / (sqrt(2) * pi * sigma^2)
+    Nr, Nz = Tn.shape
+    kb = constants.kb
+    
+    # 3.0 factor comes from thermal relaxation rate definitions for Maxwellian species
+    coeff_en = 3.0 * (me / mn) * kb
+    coeff_in = 3.0 * (mi / mn) * kb
+    
+    for i in range(Nr):
+        for j in range(Nz):
+            if mask[i, j] == 1:
+                
+                # Local variables
+                n_n = max(nn[i, j], 1e10)
+                n_e = max(ne[i, j], 1e10) # Assuming ni ~ ne
+                
+                # Heat Capacity of Neutrals (3/2 n k)
+                Cv = 1.5 * n_n * kb
+                
+                # Calculate "Stiffness" (Relaxation Rates [W/K/m3])
+                # Q = K * (T_plasma - Tn)
+                # K_en = 3 * (me/mn) * ne * nu_en * k
+                
+                K_en = coeff_en * n_e * nu_en[i, j]
+                K_in = coeff_in * n_e * nu_in[i, j] # Using ne approx ni
+                
+                K_total = K_en + K_in
+                
+                # Total Weighted Target Temperature
+                # (K_en * Te + K_in * Ti) / K_total
+                if K_total > 1e-30:
+                    T_target = (K_en * Te[i, j] + K_in * Ti[i, j]) / K_total
+                    
+                    # Effective Relaxation Frequency for Neutrals [1/s]
+                    # nu_relax = K_total / Cv
+                    nu_relax = K_total / Cv
+                    
+                    # Implicit Update
+                    # Tn_new = (Tn_old + dt * nu * T_target) / (1 + dt * nu)
+                    numerator = Tn[i, j] + dt * nu_relax * T_target
+                    denominator = 1.0 + dt * nu_relax
+                    
+                    Tn[i, j] = numerator / denominator
+                
+                # (Else: No collision coupling, Tn stays same)
 
-    prefactor = kb / (1.41421356 * 3.14159265 * sigma**2)
-    inv_L = 1.0 / L_char
+@njit(cache=True)
+def solve_implicit_viscosity_sor(un_theta, nn, mn, mask, mu_grid,
+                                 dt, dr, dz, max_iter=20, omega=1.4):
+    """
+    Solves for v_theta diffusion using Implicit SOR with variable viscosity.
+    Uses pre-calculated mu_grid field.
+    """
+    Nr, Nz = un_theta.shape
+    
+    inv_dr2 = 1.0 / (dr * dr)
+    inv_dz2 = 1.0 / (dz * dz)
 
-    for i in prange(Nr):
-        for k in range(Nz):
-            if(mask[i, k] == 0):
-                out[i, k] = 0.0
-                continue
-            # p can be very close to zero in centrifuge core (vacuum).
-            # If p -> 0, lambda -> infinity, Kn -> infinity.
-            # We clamp to a large number or 0 depending on preference. 
-            # Here we just compute valid values and set 0.0 for pure vacuum.
-            if p[i, k] > 1e-20:
-                lam = prefactor * T[i, k] / p[i, k]
-                out[i, k] = lam * inv_L
-            else:
-                out[i, k] = 0.0 # Vacuum
+    for k in range(max_iter):
+        max_diff = 0.0
+        
+        # Start at i=1 (Axis r=0 is fixed 0 velocity)
+        for i in range(1, Nr):
+            r = i * dr
+            r_plus = r + 0.5 * dr
+            r_minus = r - 0.5 * dr
+            
+            # Geometric coefficients
+            c_east = (r_plus / r) * inv_dr2
+            c_west = (r_minus / r) * inv_dr2
+            c_self_geo = 1.0 / (r * r)
+
+            for j in range(Nz):
+                if mask[i, j] == 1:
+                    
+                    # --- 1. Identify Neighbors ---
+                    # Radial
+                    if i == Nr - 1:
+                        val_E = un_theta[i, j] # Wall fallback
+                    else:
+                        val_E = un_theta[i+1, j]
+                    
+                    val_W = un_theta[i-1, j]
+
+                    # Axial
+                    if j == Nz - 1: # Symmetry
+                        val_N = un_theta[i, j]
+                        c_north = 0.0
+                    else:
+                        val_N = un_theta[i, j+1]
+                        c_north = inv_dz2
+
+                    if j == 0: # Wall
+                        val_S = 0.0 
+                        c_south = inv_dz2
+                    else:
+                        val_S = un_theta[i, j-1]
+                        c_south = inv_dz2
+                        
+                    # --- 2. Build Matrix Coefficients ---
+                    # Use local field values
+                    mu_val = mu_grid[i, j]
+                    rho = max(nn[i, j], 1e12) * mn
+                    
+                    A_time = rho / dt
+                    
+                    # Central Coefficient
+                    A_P = A_time + mu_val * (c_east + c_west + c_north + c_south + c_self_geo)
+                    
+                    # RHS
+                    RHS = (A_time * un_theta[i, j]) + mu_val * (
+                        c_east * val_E + 
+                        c_west * val_W + 
+                        c_north * val_N + 
+                        c_south * val_S
+                    )
+                    
+                    # --- 3. SOR Update ---
+                    v_star = RHS / A_P
+                    v_new = (1.0 - omega) * un_theta[i, j] + omega * v_star
+                    
+                    diff = abs(v_new - un_theta[i, j])
+                    if diff > max_diff:
+                        max_diff = diff
+                    
+                    un_theta[i, j] = v_new
+                    
+        if max_diff < 1e-4:
+            break
+
+
+@njit(cache=True)
+def solve_implicit_heat_sor(Tn, nn, mn, mask, kappa_grid, c_v,
+                            dt, dr, dz, max_iter=20, omega=1.4):
+    """
+    Solves for Neutral Temperature Diffusion implicitly using kappa_grid.
+    Uses c_v (scalar J/kg/K) to calculate volumetric heat capacity.
+    """
+    Nr, Nz = Tn.shape
+    
+    inv_dr2 = 1.0 / (dr * dr)
+    inv_dz2 = 1.0 / (dz * dz)
+
+    for k in range(max_iter):
+        
+        # Enforce Axis Symmetry
+        for j_sym in range(Nz):
+            if mask[0, j_sym] == 1:
+                Tn[0, j_sym] = Tn[1, j_sym]
+
+        for i in range(1, Nr):
+            r = i * dr
+            r_plus = r + 0.5 * dr
+            r_minus = r - 0.5 * dr
+            
+            c_east = (r_plus / r) * inv_dr2
+            c_west = (r_minus / r) * inv_dr2
+            
+            for j in range(Nz):
+                if mask[i, j] == 1:
+                    
+                    # --- Neighbors ---
+                    # Radial
+                    if i == Nr - 1:
+                        val_E = Tn[i, j] # Fallback
+                        if i+1 < Nr: val_E = Tn[i+1, j]
+                    else:
+                        val_E = Tn[i+1, j]
+                        
+                    val_W = Tn[i-1, j]
+
+                    # Axial
+                    if j == Nz - 1: # Symmetry
+                        val_N = Tn[i, j]
+                        c_north = 0.0
+                    else:
+                        val_N = Tn[i, j+1]
+                        c_north = inv_dz2
+
+                    if j == 0: # Wall
+                        val_S = 300.0 
+                        c_south = inv_dz2
+                    else:
+                        val_S = Tn[i, j-1]
+                        c_south = inv_dz2
+
+                    # --- Matrix Setup ---
+                    # Use local field values
+                    kappa_val = kappa_grid[i, j]
+                    
+                    # Heat Capacity per volume = rho * c_v (J/m^3/K)
+                    rho = max(nn[i, j], 1e12) * mn
+                    Cv_vol = rho * c_v
+                    
+                    A_time = Cv_vol / dt
+                    
+                    A_P = A_time + kappa_val * (c_east + c_west + c_north + c_south)
+                    
+                    RHS = (A_time * Tn[i, j]) + kappa_val * (
+                        c_east * val_E + 
+                        c_west * val_W + 
+                        c_north * val_N + 
+                        c_south * val_S
+                    )
+                    
+                    # --- SOR Update ---
+                    T_star = RHS / A_P
+                    T_new = (1.0 - omega) * Tn[i, j] + omega * T_star
+                    
+                    Tn[i, j] = T_new
