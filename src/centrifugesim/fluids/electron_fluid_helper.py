@@ -512,7 +512,7 @@ def apply_townsend_ionization_sheath(p_grid,
 @njit(cache=True)
 def time_advance_ne_analytic_kernel_anisotropic(ne_out, ne_old, 
                                                 nu_iz, nu_loss, nu_RR, beta_rec, 
-                                                dt, mask):
+                                                dt, mask, ne_floor):
     """
     Solves the logistic growth/decay equation analytically for density:
         dn/dt = (nu_iz - nu_loss - nu_RR) * n - beta_rec * n^2
@@ -539,7 +539,7 @@ def time_advance_ne_analytic_kernel_anisotropic(ne_out, ne_old,
     EXP_LIMIT = 100.0 
     
     # Minimum density floor to prevent div-by-zero or negative densities
-    NE_FLOOR = 1e10 
+    NE_FLOOR = ne_floor
     
     for i in range(Nr):
         for j in range(Nz):

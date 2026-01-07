@@ -160,24 +160,6 @@ class NeutralFluidContainer:
         self.un_z_grid[geom.mask==1]        = np.copy(un_z_new[geom.mask==1])
         self.T_n_grid[geom.mask==1]         = np.copy(Tn_new[geom.mask==1])
 
-    def update_u_in_collisions_implicit(self, geom, ion_fluid, dt):
-        """
-        Updates Neutral velocity due to collisions with Ions using an implicit formula.
-        Used when fluid ions are on.
-        Do not use this when kinetic ions are on.
-        """
-        neutral_fluid_helper.update_neutral_vtheta_implicit_source(
-            self.un_theta_grid,
-            ion_fluid.vi_theta_grid,
-            ion_fluid.ni_grid,
-            ion_fluid.nu_i_grid,
-            ion_fluid.m_i,
-            self.nn_grid,
-            self.mass,
-            dt,
-            geom.mask
-        )
-
     def advance_with_T_ssp_rk2(self,
                             geom, dt,
                             c_iso,
@@ -307,4 +289,83 @@ class NeutralFluidContainer:
 
         # z = L wall: Neumann (symmetry plane so no flux)
         self.T_n_grid[:,-1] = self.T_n_grid[:,-2]
-    
+
+    ###########################################################################################
+    ### Methods used when fluid ions are on (not kinetic ions)
+    ###########################################################################################
+
+    # To test temperature update implicit due to collisions
+    def update_temperature_collisions_implicit(self, ion_fluid, electron_fluid, geom, dt):
+        """
+        Updates T_gas implicitly based on elastic collisions with Electrons and Ions.
+        """
+        neutral_fluid_helper.update_neutral_temperature_implicit(
+            self.T_n_grid,          # In/Out: Updated in place
+            electron_fluid.Te_grid,
+            ion_fluid.Ti_grid,
+            electron_fluid.ne_grid,
+            self.nn_grid,
+            electron_fluid.nu_en_grid,
+            ion_fluid.nu_i_grid,    # Ion-neutral collision freq
+            constants.m_e,
+            ion_fluid.m_i,
+            self.mass,              # Neutral mass
+            dt,
+            geom.mask
+        )
+
+    def update_u_in_collisions_implicit(self, geom, ion_fluid, dt):
+        """
+        Updates Neutral velocity due to collisions with Ions using an implicit formula.
+        Used when fluid ions are on.
+        Do not use this when kinetic ions are on.
+        """
+        neutral_fluid_helper.update_neutral_vtheta_implicit_source(
+            self.un_theta_grid,
+            ion_fluid.vi_theta_grid,
+            ion_fluid.ni_grid,
+            ion_fluid.nu_i_grid,
+            ion_fluid.m_i,
+            self.nn_grid,
+            self.mass,
+            dt,
+            geom.mask
+        )
+
+    def update_diffusion_implicit(self, geom, dt):
+        """
+        Applies implicit Viscosity and Thermal Conduction using 
+        pre-calculated mu_grid and kappa_grid fields.
+        """
+        # 1. Update Viscosity (Momentum Sink)
+        neutral_fluid_helper.solve_implicit_viscosity_sor(
+            self.un_theta_grid,
+            self.nn_grid,
+            self.mass,
+            self.fluid,      # The mask
+            self.mu_grid,    # NEW: Passing the field
+            dt,
+            geom.dr,
+            geom.dz,
+            max_iter=20,
+            omega=1.4
+        )
+        
+        # 2. Update Thermal Conduction (Energy Sink)
+        neutral_fluid_helper.solve_implicit_heat_sor(
+            self.T_n_grid,
+            self.nn_grid,
+            self.mass,
+            self.fluid,
+            self.kappa_grid, # NEW: Passing the field
+            self.c_v,        # NEW: Passing scalar c_v
+            dt,
+            geom.dr,
+            geom.dz,
+            max_iter=20,
+            omega=1.4
+        )
+
+        self.apply_bc_T()
+        self.apply_bc_isothermal()
+

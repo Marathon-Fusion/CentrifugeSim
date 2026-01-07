@@ -338,7 +338,7 @@ def solve_vtheta_gs_sor(phi, Bz, sigma_P, mu, dr, dz, mask,
 
 # Ions vtheta update kernel using momentum balance given by algebraic solution JxB - Drag = 0
 @njit(cache=True)
-def update_vtheta_kernel_algebraic(vtheta_out, Jr, Bz, ni, nu_in, un_theta, mask, mi):
+def update_vtheta_kernel_algebraic(vtheta_out, Jir, Bz, ni, nu_in, un_theta, mask, mi):
     """
     Solves the steady-state algebraic momentum balance for Ion v_theta:
     0 = (J x B) - Drag
@@ -347,7 +347,7 @@ def update_vtheta_kernel_algebraic(vtheta_out, Jr, Bz, ni, nu_in, un_theta, mask
     Parameters:
     -----------
     vtheta_out : 2D array (Nr, Nz) to be updated in-place
-    Jr         : 2D array (Nr, Nz), Total radial Current Density
+    Jir         : 2D array (Nr, Nz), Ion radial Current Density
     Bz         : 2D array (Nr, Nz), Axial Magnetic Field
     ni         : 2D array (Nr, Nz), Ion Density
     nu_in      : 2D array (Nr, Nz), Ion-Neutral Collision Freq
@@ -355,7 +355,7 @@ def update_vtheta_kernel_algebraic(vtheta_out, Jr, Bz, ni, nu_in, un_theta, mask
     mask       : 2D array (Nr, Nz), 1=Plasma, 0=Solid
     mi         : float, Ion Mass
     """
-    Nr, Nz = Jr.shape
+    Nr, Nz = Jir.shape
     
     for i in range(Nr):
         for j in range(Nz):
@@ -366,7 +366,7 @@ def update_vtheta_kernel_algebraic(vtheta_out, Jr, Bz, ni, nu_in, un_theta, mask
                                     
                 # Force calculation
                 # Lorentz Force term (assuming J_r x B_z -> -theta direction)
-                F_lorentz = -1.0 * Jr[i, j] * Bz[i, j]
+                F_lorentz = -1.0 * Jir[i, j] * Bz[i, j]
                     
                 # Drag coefficient = rho_i * nu_in
                 drag_coeff = mi * n_local * nu_local

@@ -67,7 +67,7 @@ class IonFluidContainer:
         """
         ion_fluid_helper.update_vtheta_kernel_algebraic(
             self.vi_theta_grid,           # Output
-            hybrid_pic.Jr_grid,           # Input, total current
+            hybrid_pic.Jir_grid,           # Input, total current
             hybrid_pic.Bz_grid,           # Input
             self.ni_grid,                 # Input
             self.nu_i_grid,               # Input
